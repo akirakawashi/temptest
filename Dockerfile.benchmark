@@ -1,0 +1,43 @@
+# Отдельный NVIDIA CUDA стенд; CPU-образ монитора не нужен.
+ARG PYTHON_IMAGE=python:3.13-slim
+FROM ${PYTHON_IMAGE} AS models
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl bzip2 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY scripts/download_models.sh /tmp/download_models.sh
+# GigaAM CUDA скачает официальный PyTorch checkpoint при ручном запуске.
+RUN DOWNLOAD_ASR=0 sh /tmp/download_models.sh /models
+
+FROM ${PYTHON_IMAGE} AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates ffmpeg libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH \
+    PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    MODELS_DIR=/models EMO_CACHE=/cache/gigaam HOME=/tmp \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.13/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cuda_runtime/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cufft/lib:/opt/venv/lib/python3.13/site-packages/nvidia/curand/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cusparse/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+RUN pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchaudio==2.10.0
+COPY requirements.txt /tmp/app-requirements.txt
+COPY benchmark/requirements.txt /tmp/benchmark-requirements.txt
+RUN sed '/^sherpa-onnx==/d; /^onnxruntime==/d' /tmp/app-requirements.txt > /tmp/gpu-requirements.txt \
+ && pip install -r /tmp/gpu-requirements.txt -r /tmp/benchmark-requirements.txt
+ARG GIGAAM_REF=7447938d791c4f3e643386ee22c33777004293a5
+RUN pip install "gigaam @ git+https://github.com/salute-developers/GigaAM.git@${GIGAAM_REF}" \
+ && pip uninstall -y onnxruntime \
+ && pip install onnxruntime-gpu==1.24.4 \
+ && pip install 'sherpa-onnx==1.13.4+cuda12.cudnn9' \
+      -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
+RUN useradd --system --uid 10001 --no-create-home app \
+ && mkdir -p /cache/gigaam \
+ && chown -R app /cache
+COPY --from=models /models /models
+WORKDIR /srv
+COPY app /srv/app
+COPY benchmark /srv/benchmark
+USER app
+HEALTHCHECK NONE
+ENTRYPOINT ["python", "-m", "benchmark.compare"]
+CMD []

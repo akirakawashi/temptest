@@ -1,0 +1,207 @@
+"""Без запросов на рабочий сервер, Docker, скачиваний и GPU inference."""
+import asyncio
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+
+import httpx
+import pytest
+
+from benchmark import artifacts, compare, server_run
+from benchmark.whisper_api import WhisperAPI, speech_seconds, validate_url
+from test_benchmark import install_fake_runners, write_wav
+
+
+def test_gpu_reserve_stops_only_benchmark_model_loading(monkeypatch):
+    from types import SimpleNamespace
+    from benchmark.gpu import log_gpu_memory
+
+    monkeypatch.setenv("BENCH_GPU_RESERVE_MIB", "4096")
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(
+        mem_get_info=lambda _: (3000 * 1024 ** 2, 95830 * 1024 ** 2),
+        memory_allocated=lambda _: 1, memory_reserved=lambda _: 1)))
+    with pytest.raises(RuntimeError, match="Останавливаем только стенд"):
+        log_gpu_memory("загрузки ASR")
+
+
+@pytest.mark.parametrize("url", ["https://api.openai.com/v1", "http://1.1.1.1/v1", "http://user:password@10.0.0.1/v1", "http://10.0.0.1/v1?token=abc"])
+def test_external_endpoint_credentials_and_query_are_rejected(url):
+    with pytest.raises(ValueError):
+        validate_url(url)
+
+
+def test_detected_duration_uses_union_not_sum_of_overlapping_segments():
+    assert speech_seconds([{"start": 0, "end": 3, "text": "А"}, {"start": 2, "end": 6, "text": "Б"},
+                           {"start": 6, "end": 8, "text": ""}], 5) == 5
+
+
+@pytest.mark.parametrize("failure", [429, 503, "timeout", "redirect", "malformed"])
+def test_api_never_retries_or_follows_redirects_and_redacts_key(tmp_path, failure):
+    path = tmp_path / "audio.wav"
+    write_wav(path, 100)
+    requests = []
+    key = "secret-test-key"
+
+    def response(request):
+        requests.append(request)
+        assert request.headers["authorization"] == f"Bearer {key}"
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Тест", request=request)
+        if failure == "redirect":
+            return httpx.Response(307, headers={"location": "https://external.example/v1"})
+        if failure == "malformed":
+            return httpx.Response(200, json={"wrong": key})
+        return httpx.Response(failure, json={"error": key})
+
+    async def scenario():
+        client = WhisperAPI("http://10.220.21.2:8002/v1", key, "large-v3", 1200, httpx.MockTransport(response))
+        try:
+            result = await client.run(path, 0.2)
+            assert result["status"] == "error" and result["attempts"] == 1
+            assert len(requests) == 1
+            assert key not in json.dumps(result)
+            assert result["server_may_still_be_processing"] is (failure == "timeout")
+        finally:
+            await client.close()
+    asyncio.run(scenario())
+
+
+def test_whisper_uses_only_health_models_and_transcription_endpoints(tmp_path):
+    path = tmp_path / "audio.wav"
+    write_wav(path, 100)
+    requests = []
+
+    def response(request):
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok", "model": "large-v3"})
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "large-v3"}]})
+        body = request.read()
+        assert b'verbose_json' in body and b'vad_filter' in body and b'large-v3' in body
+        return httpx.Response(200, json={"text": "Тест", "segments": [{"start": 0, "end": 0.2, "text": "Тест"}]})
+
+    async def scenario():
+        client = WhisperAPI("http://10.220.21.2:8002/v1", "test-key", "large-v3", 1200, httpx.MockTransport(response))
+        try:
+            await client.check()
+            result = await client.run(path, 0.2)
+            assert result["speech_seconds"] == 0.2
+            assert result["server_processing_seconds"] is None
+        finally:
+            await client.close()
+    asyncio.run(scenario())
+    assert requests == [("GET", "/health"), ("GET", "/v1/models"), ("POST", "/v1/audio/transcriptions")]
+
+
+def test_wrong_model_is_rejected_before_transcription():
+    def response(request):
+        assert request.method == "GET"
+        return httpx.Response(200, json={"status": "ok", "data": [{"id": "other-model"}]})
+
+    async def scenario():
+        client = WhisperAPI("http://10.0.0.1/v1", "key", "large-v3", 10, httpx.MockTransport(response))
+        try:
+            with pytest.raises(RuntimeError, match="менять/загружать"):
+                await client.check()
+        finally:
+            await client.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_all_whisper_requests_precede_gigaam_and_error_blocks_phase(tmp_path, monkeypatch, failure):
+    source, output = tmp_path / "input", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    write_wav(source / "1.wav", 100)
+    write_wav(source / "2.wav", 200)
+    calls = install_fake_runners(monkeypatch)
+    api_calls = []
+
+    class API:
+        def __init__(self, *args):
+            self.base_url = "http://10.0.0.1/v1"
+        async def check(self):
+            return {"status": "ok"}
+        async def health(self):
+            return {"status": "ok"}
+        async def close(self):
+            pass
+        async def run(self, path, duration):
+            api_calls.append(path.name)
+            return {"status": "error" if failure else "ok", "mode": "existing_server_api", "elapsed_seconds": 1,
+                    "segments": [], "text": "Тест", "speech_seconds": 0, "error": "Ошибка" if failure else None}
+
+    async def no_sleep(*args):
+        pass
+    monkeypatch.setattr(server_run, "WhisperAPI", API)
+    monkeypatch.setattr(server_run.asyncio, "sleep", no_sleep)
+    args = compare.parser().parse_args(["--audio-dir", str(source), "--out", str(output), "--expected-files", "2", "--threads", "1"])
+    assert asyncio.run(server_run.whisper_phase(args)) == int(failure)
+    assert not calls  # GigaAM не загрузилась во время фазы Whisper.
+    if failure:
+        assert len(api_calls) == 1
+        with pytest.raises(ValueError):
+            asyncio.run(server_run.gigaam_phase(args))
+    else:
+        assert len(api_calls) == 2
+        assert asyncio.run(server_run.gigaam_phase(args)) == 0
+        assert [name for name, _ in calls] == ["gigaam", "gigaam"]
+        assert (output / "отчёт.html").is_file()
+        artifacts.finalize(output, 0)
+        assert not (output / "временные").exists()
+        with tarfile.open(output / "диагностика.tar.gz") as archive:
+            assert "отчёт.html" in archive.getnames()
+            assert all(not name.endswith(".wav") for name in archive.getnames())
+
+
+def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
+    source, output = tmp_path / "input", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    write_wav(source / "1.wav", 100)
+    def forbidden(*args):
+        raise AssertionError("Клиент не должен создаваться")
+    monkeypatch.setattr(server_run, "WhisperAPI", forbidden)
+    args = compare.parser().parse_args(["--audio-dir", str(source), "--out", str(output), "--expected-files", "100"])
+    assert asyncio.run(server_run.whisper_phase(args)) == 1
+
+
+@pytest.mark.parametrize("free, api_exit", [(14600, 0), (90000, 47), (90000, 0)])
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, api_exit):
+    folder = tmp_path / "stand"
+    (folder / "benchmark").mkdir(parents=True)
+    script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
+    (folder / "benchmark" / "run.sh").write_bytes(script.read_bytes())
+    (folder / "audio").mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    docker = bin_dir / "docker"
+    docker.write_text('#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\nwith open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
+                      'if "info" in a: print("/tmp")\n'
+                      'sys.exit(int(os.environ["API_EXIT"]) if "whisper-api" in a else 0)\n')
+    nvidia = bin_dir / "nvidia-smi"
+    nvidia.write_text('#!/usr/bin/env python3\nimport os,sys\na=" ".join(sys.argv)\n'
+                      'print(os.environ["FREE_GPU"] if "--query-gpu=memory.free" in a else "0" if "--query-gpu=utilization.gpu" in a else "2026/10/07, uuid, 0, 1000, 90000, 95830, 80, 32")\n')
+    docker.chmod(0o755)
+    nvidia.chmod(0o755)
+    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
+           "FREE_GPU": str(free), "API_EXIT": str(api_exit), "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
+    result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == (42 if free < 16384 else api_exit)
+    commands = command_log.read_text()
+    assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands
+    if free < 16384 or api_exit:
+        assert "'build', 'compare'" not in commands and "'up', '-d', 'ollama'" not in commands
+    else:
+        assert commands.index("whisper-api") < commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
+        assert "'stop', 'ollama'" in commands and "'stop', 'ollama-download'" in commands
+    if free < 16384:
+        assert "whisper-api" not in commands

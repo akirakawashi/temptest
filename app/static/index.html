@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Речевой монитор · АйСи Групп</title>
+  <link rel="icon" type="image/png" href="/assets/brand/ic-group-mark-white-green.png">
+  <link rel="preload" href="/assets/fonts/montserrat-cyrillic-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/assets/fonts/inter-cyrillic-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/assets/css/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-mark" src="/assets/brand/ic-group-mark-white-green.png" alt="АйСи Групп" width="54" height="30">
+      <div class="brand-text">
+        <span class="brand-title">Речевой монитор</span>
+        <span class="brand-sub">АйСи Групп · анализ разговора в реальном времени</span>
+      </div>
+    </div>
+    <nav class="hud-tabs" role="tablist" aria-label="Разделы">
+      <button class="hud-tab is-active" role="tab" aria-selected="true" data-view="chat">Диалог</button>
+      <button class="hud-tab" role="tab" aria-selected="false" data-view="dashboard">Дашборд</button>
+    </nav>
+    <div class="topbar-right">
+      <div class="rec-state" id="recState" aria-live="polite">
+        <span class="rec-dot" aria-hidden="true"></span>
+        <span id="recLabel">Микрофон выключен</span>
+        <span class="rec-time" id="recTime">00:00</span>
+      </div>
+      <button class="btn btn-primary" id="micBtn" disabled>Начать запись</button>
+      <button class="btn" id="resetBtn" title="Очистить диалог и забыть голоса">Новый разговор</button>
+      <div class="menu-wrap">
+        <button class="btn btn-icon" id="settingsBtn" aria-haspopup="true" aria-expanded="false" title="Настройки" aria-label="Настройки">
+          <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M3 6h7m4 0h3M3 14h3m4 0h7"/><circle cx="12" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8" cy="14" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+        </button>
+        <div class="menu frame" id="settingsMenu" hidden>
+          <div class="menu-title">Настройки</div>
+          <label class="field">
+            <span class="field-label">Строгость разделения голосов <b id="thrValue">0,45</b></span>
+            <input type="range" id="thrRange" min="0.25" max="0.70" step="0.01" value="0.45">
+            <span class="field-hint">Ниже — похожие голоса чаще объединяются. Выше — один человек может раздвоиться.</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="splitToggle" checked>
+            <span>Делить реплику, если голос сменился без паузы</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="dspToggle">
+            <span>Шумоподавление и автоусиление браузера</span>
+          </label>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <main>
+    <!-- ============================== ДИАЛОГ ============================== -->
+    <section class="view is-active" id="view-chat" aria-label="Диалог">
+      <div class="chat-layout">
+        <div class="panel frame chat-col">
+          <div class="panel-head">
+            <span class="chev" aria-hidden="true"></span>
+            <h2>Диалог</h2>
+            <span class="panel-meta" id="chatMeta">реплики появляются через 1–3 с после паузы</span>
+          </div>
+          <div class="chat" id="chat" aria-live="polite">
+            <div class="empty" id="chatEmpty">
+              <div class="empty-title">Здесь появится разговор</div>
+              <p>Нажмите «Начать запись» и разрешите браузеру доступ к микрофону. Собеседники определяются по голосу, эмоции — по тону.</p>
+              <p class="muted" id="emptyStatus"></p>
+            </div>
+          </div>
+        </div>
+        <aside class="rail">
+          <div class="panel frame">
+            <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>Сейчас</h2><span class="pill" id="vadPill">тишина</span></div>
+            <div class="panel-body">
+              <canvas id="spectrum" class="spectrum" height="72" aria-label="Спектр сигнала с микрофона"></canvas>
+              <div class="meter" aria-label="Уровень сигнала"><div class="meter-fill" id="meterFill"></div></div>
+              <div class="meter-scale"><span>−60 дБ</span><span id="meterValue">—</span><span>0 дБ</span></div>
+            </div>
+          </div>
+          <div class="panel frame">
+            <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>Собеседники</h2><span class="panel-meta" id="speakersCount"></span></div>
+            <div class="panel-body">
+              <div id="speakersList" class="speakers"><p class="muted small">Появятся с первой репликой. Имя можно изменить — нажмите на него.</p></div>
+            </div>
+          </div>
+          <div class="panel frame">
+            <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>Сессия</h2></div>
+            <div class="panel-body"><dl class="facts" id="railFacts"></dl></div>
+          </div>
+          <div class="panel frame">
+            <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>Модели</h2></div>
+            <div class="panel-body"><ul class="components" id="railComponents"></ul></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============================= ДАШБОРД ============================= -->
+    <section class="view" id="view-dashboard" aria-label="Дашборд" hidden>
+      <div class="dash">
+
+        <!-- главный экран -->
+        <div class="hero">
+          <div class="panel frame hero-main">
+            <div class="hero-bar">
+              <div class="legend-inline" id="heroLegend" aria-label="Цвет плитки — преобладающая эмоция"></div>
+              <div class="hud-tabs" id="windowTabs" role="group" aria-label="Период">
+                <button class="hud-tab is-active" data-window="0">Весь разговор</button>
+                <button class="hud-tab" data-window="300">5 минут</button>
+                <button class="hud-tab" data-window="60">1 минута</button>
+              </div>
+            </div>
+            <div class="hub" id="hub"></div>
+          </div>
+
+          <div class="hero-side">
+            <div class="panel frame" id="p-live">
+              <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>В реальном времени</h2><span class="panel-meta" id="liveMeta"></span></div>
+              <div class="panel-body">
+                <div class="hud-tabs is-small" id="liveTabs" role="group" aria-label="Показатель">
+                  <button class="hud-tab is-active" data-key="level">Уровень, дБ</button>
+                  <button class="hud-tab" data-key="latency">Задержка, с</button>
+                  <button class="hud-tab" data-key="cpu">Процессор, %</button>
+                  <button class="hud-tab" data-key="mem">Память, ГБ</button>
+                </div>
+                <div class="chart-box" id="liveChart"></div>
+              </div>
+            </div>
+            <div class="panel frame" id="p-mood">
+              <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>Настроение</h2><span class="panel-meta" id="moodMeta"></span></div>
+              <div class="panel-body">
+                <div class="hud-tabs is-small" id="moodTabs" role="group" aria-label="Вид">
+                  <button class="hud-tab is-active" data-key="trend">Динамика</button>
+                  <button class="hud-tab" data-key="share">По собеседникам</button>
+                </div>
+                <div class="chart-box" id="moodChart"></div>
+                <div id="moodLegend"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel frame hero-rings">
+            <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>Эмоции разговора</h2><span class="panel-meta">доля времени речи</span></div>
+            <div class="rings" id="emoRings"></div>
+          </div>
+
+          <div class="panel frame hero-sys">
+            <div class="panel-head"><span class="chev" aria-hidden="true"></span><h2>Система</h2><span class="panel-meta" id="sysMeta"></span></div>
+            <div class="mini-rings" id="sysRings"></div>
+          </div>
+        </div>
+
+        <!-- показатели одной строкой -->
+        <div class="stats" id="statStrip"></div>
+
+        <div class="grid">
+          <figure class="panel frame span-all" id="c-timeline"></figure>
+          <figure class="panel frame span-all" id="c-speakers"></figure>
+          <figure class="panel frame" id="c-durations"></figure>
+          <figure class="panel frame" id="c-gaps"></figure>
+          <figure class="panel frame" id="c-latency"></figure>
+          <figure class="panel frame" id="c-words"></figure>
+          <figure class="panel frame span-2" id="c-stages"></figure>
+          <div class="panel frame span-all" id="c-llm"></div>
+          <div class="panel frame span-all" id="c-models"></div>
+          <div class="panel frame span-all" id="c-params"></div>
+        </div>
+
+        <footer class="foot">Данные: текущая сессия записи с микрофона. Единицы подписаны на графиках. Ничего не сохраняется после закрытия вкладки.</footer>
+      </div>
+    </section>
+  </main>
+
+  <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+  <script>
+    // Если скрипты интерфейса не запустились, пишем об этом на странице, а не оставляем её «мёртвой».
+    window.addEventListener("error", function (e) {
+      if (window.__appStarted) return;
+      var t = e.target, file = t && (t.tagName === "SCRIPT" || t.tagName === "LINK") ? (t.src || t.href) : "";
+      if (!e.message && !file) return;
+      var b = document.getElementById("banner");
+      b.textContent = "Интерфейс не запустился: " + (e.message || "не загрузился файл " + file) +
+        ". Обновите страницу без кэша: Cmd+Shift+R (в Windows — Ctrl+F5).";
+      b.hidden = false; b.className = "banner is-error";
+    }, true);
+  </script>
+  <script type="module" src="/assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+# Версии зафиксированы на тех, с которыми проект проверялся (Python 3.13).
+# torch, torchaudio и gigaam ставятся отдельными шагами в Dockerfile.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+httpx==0.28.1
+psutil==7.2.2
+numpy==2.5.3
+sherpa-onnx==1.13.8
+onnxruntime==1.23.2
+silero-vad==6.2.3

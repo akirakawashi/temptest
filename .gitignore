@@ -1,0 +1,10 @@
+.env
+.venv/
+models/
+__pycache__/
+*.pyc
+.pytest_cache/
+benchmark-results/
+benchmark-cache/
+.benchmark.lock
+.local-backup/

@@ -1,0 +1,131 @@
+# Изолированный файловый стенд. Обычный речевой монитор не запускается.
+name: speech-comparison
+
+services:
+  whisper-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper-client
+    image: speech-comparison:3.0.0-api-client
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: 2g
+    environment:
+      BENCH_THREADS: ${BENCH_THREADS:-4}
+      BENCH_GPU: ${BENCH_GPU:-0}
+      BENCH_GPU_MIN_FREE_MIB: ${BENCH_GPU_MIN_FREE_MIB:-16384}
+      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
+      BENCH_MIN_RAM_MIB: ${BENCH_MIN_RAM_MIB:-20480}
+      WHISPER_API_BASE_URL: ${WHISPER_API_BASE_URL:-http://10.220.21.2:8002/v1}
+      WHISPER_API_KEY: ${WHISPER_API_KEY:-}
+      WHISPER_API_MODEL: ${WHISPER_API_MODEL:-large-v3}
+      BENCH_API_GAP: ${BENCH_API_GAP:-5}
+      BENCH_API_TIMEOUT: ${BENCH_API_TIMEOUT:-1200}
+      BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
+      - ${BENCH_OUT:?Укажите папку отчётов}:/results
+
+  compare:
+    build:
+      context: .
+      dockerfile: Dockerfile.benchmark
+    image: speech-comparison:2.0.0-cuda
+    platform: linux/amd64
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: ${BENCH_WORKER_MEMORY:-8g}
+    environment:
+      BENCH_THREADS: ${BENCH_THREADS:-4}
+      PYTHONFAULTHANDLER: "1"
+      OMP_NUM_THREADS: ${BENCH_THREADS:-4}
+      MKL_NUM_THREADS: ${BENCH_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${BENCH_THREADS:-4}
+      BENCH_GPU: ${BENCH_GPU:-0}
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
+      OLLAMA_URL: http://ollama:11434
+      LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
+      LLM_AUTOPULL: "false"
+      VAD_THRESHOLD: ${VAD_THRESHOLD:-0.5}
+      VAD_MIN_SILENCE: ${VAD_MIN_SILENCE:-0.45}
+      VAD_MAX_SPEECH: ${VAD_MAX_SPEECH:-15}
+      SPEAKER_THRESHOLD: ${SPEAKER_THRESHOLD:-0.45}
+      MAX_SPEAKERS: ${MAX_SPEAKERS:-5}
+      SPLIT_TURNS: ${SPLIT_TURNS:-true}
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
+      - ${BENCH_OUT:?Укажите папку отчётов}:/results
+      - ${BENCH_CACHE:?Укажите папку кеша моделей}:/cache
+    depends_on:
+      - ollama
+    networks: [gigaam]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${BENCH_GPU:-0}"]
+              capabilities: [gpu]
+
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: ${BENCH_LLM_MEMORY:-10g}
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_NO_CLOUD: "1"
+    networks: [gigaam]
+    volumes:
+      - comparison-ollama:/root/.ollama
+    # Та же GPU, что у compare; порт доступен только внутри стенда.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${BENCH_GPU:-0}"]
+              capabilities: [gpu]
+
+  prefetch:
+    image: speech-comparison:2.0.0-cuda
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: 8g
+    entrypoint: ["python", "-m", "benchmark.prefetch"]
+    environment:
+      EMO_CACHE: /cache/gigaam
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    volumes:
+      - ${BENCH_CACHE:?Укажите папку кеша моделей}:/cache
+
+  ollama-download:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    mem_limit: 2g
+    environment:
+      OLLAMA_NO_CLOUD: "1"
+      LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
+    volumes:
+      - comparison-ollama:/root/.ollama
+
+networks:
+  gigaam:
+    internal: true
+
+volumes:
+  comparison-ollama:

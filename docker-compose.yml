@@ -1,0 +1,51 @@
+name: speech-monitor
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.13-slim}
+        MODELS_BASE_URL: ${MODELS_BASE_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download}
+    image: speech-monitor:1.1.0
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    ports:
+      # Только с этого компьютера. Браузер даёт доступ к микрофону на http://localhost без HTTPS.
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    environment:
+      ASR_THREADS: ${ASR_THREADS:-4}
+      SPK_THREADS: ${SPK_THREADS:-2}
+      VAD_THRESHOLD: ${VAD_THRESHOLD:-0.5}
+      VAD_MIN_SILENCE: ${VAD_MIN_SILENCE:-0.45}
+      VAD_MAX_SPEECH: ${VAD_MAX_SPEECH:-15}
+      SPEAKER_THRESHOLD: ${SPEAKER_THRESHOLD:-0.45}
+      MAX_SPEAKERS: ${MAX_SPEAKERS:-5}
+      SPLIT_TURNS: ${SPLIT_TURNS:-true}
+      EMO_ENABLED: ${EMO_ENABLED:-true}
+      EMO_THREADS: ${EMO_THREADS:-2}
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
+      LLM_AUTOPULL: ${LLM_AUTOPULL:-true}
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
+      LLM_KEEP_ALIVE: ${LLM_KEEP_ALIVE:-1m}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Здесь лежат только веса модели эмоций (скачиваются один раз). Разговоры не сохраняются нигде.
+      - emo-cache:/cache
+
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    restart: unless-stopped
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama:/root/.ollama
+    # Порт наружу не публикуется: к модели обращается только приложение.
+
+volumes:
+  emo-cache:
+  ollama:

@@ -1,0 +1,9 @@
+# Лёгкий клиент: не содержит моделей и не получает доступ к GPU.
+FROM python:3.13-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir httpx==0.28.1
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Europe/Moscow
+WORKDIR /srv
+COPY benchmark /srv/benchmark
+ENTRYPOINT ["python", "-m", "benchmark.compare"]
