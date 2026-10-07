@@ -1,0 +1,8 @@
+# Только контрольная сборка; рабочие сервисы, записи и GPU не подключаются.
+name: speech-comparison-build-check
+
+services:
+  check:
+    image: speech-comparison:apt-check
+    build:
+      context: .
