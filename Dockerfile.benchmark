@@ -1,5 +1,5 @@
 # Отдельный NVIDIA CUDA стенд; CPU-образ монитора не нужен.
-ARG PYTHON_IMAGE=python:3.13-slim-bookworm
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 FROM ${PYTHON_IMAGE} AS models
 RUN apt-get -o APT::Update::Error-Mode=any update \
  && apt-get install -y --no-install-recommends curl bzip2 ca-certificates \
@@ -18,7 +18,7 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     MODELS_DIR=/models EMO_CACHE=/cache/gigaam HOME=/tmp \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    LD_LIBRARY_PATH=/opt/venv/lib/python3.13/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cuda_runtime/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cufft/lib:/opt/venv/lib/python3.13/site-packages/nvidia/curand/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cusparse/lib:/opt/venv/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/venv/lib/python3.12/site-packages/nvidia/curand/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cusparse/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
 RUN pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchaudio==2.10.0
 COPY requirements.txt /tmp/app-requirements.txt
 COPY benchmark/requirements.txt /tmp/benchmark-requirements.txt

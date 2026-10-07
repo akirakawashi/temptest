@@ -189,7 +189,7 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     command_log = tmp_path / "commands.log"
     docker = bin_dir / "docker"
     docker.write_text('#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\nwith open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
-                      'if a[:2] == ["buildx","build"] and "speech-comparison:3.0.0-api-client" in a: sys.exit(int(os.environ["CLIENT_BUILD_EXIT"]))\n'
+                      'if a[0] == "compose" and "build" in a and a[-1] == "whisper-client": sys.exit(int(os.environ["CLIENT_BUILD_EXIT"]))\n'
                       'if "info" in a: print("/tmp")\n'
                       'sys.exit(int(os.environ["API_EXIT"]) if "whisper-api" in a else 0)\n')
     nvidia = bin_dir / "nvidia-smi"
@@ -200,7 +200,7 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
            "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
            "BENCH_GPU_MAX_UTIL": str(max_util),
-           "BENCH_BUILD_NETWORK": "host",
+           "BENCH_BUILD_NETWORK": "default",
            "API_EXIT": str(api_exit), "CLIENT_BUILD_EXIT": str(client_build_exit),
            "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
@@ -208,19 +208,22 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     precheck_failed = free < min_free or util > max_util
     assert result.returncode == (42 if precheck_failed else client_build_exit or api_exit)
     commands = command_log.read_text()
-    builds = [ast.literal_eval(line) for line in commands.splitlines() if "'buildx', 'build'" in line]
+    builds = [command for line in commands.splitlines()
+              if (command := ast.literal_eval(line))[0] == "compose" and "build" in command]
     for build in builds:
-        assert "--builder=default" in build and "--network=host" in build
-        assert "--allow=network.host" in build and "--progress=plain" in build and "--load" in build
-        assert build[-1] == str(folder)
-    assert "'compose', 'build'" not in commands
+        assert build[build.index("--project-name") + 1] == "speech-comparison"
+        assert build[build.index("--project-directory") + 1] == str(folder)
+        assert build[build.index("-f") + 1] == str(folder / "compose.benchmark.yml")
+        assert build[build.index("--progress") + 1] == "plain"
+        assert build[-1] in {"whisper-client", "compare"}
+    assert "'buildx', 'build'" not in commands
     assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands
     if precheck_failed or client_build_exit or api_exit:
-        assert "speech-comparison:2.0.0-cuda" not in commands and "'up', '-d', 'ollama'" not in commands
+        assert "'build', 'compare'" not in commands and "'up', '-d', 'ollama'" not in commands
         assert len(builds) == (0 if precheck_failed else 1)
     else:
         assert len(builds) == 2
-        assert commands.index("whisper-api") < commands.index("speech-comparison:2.0.0-cuda") < commands.index("'up', '-d', 'ollama'")
+        assert commands.index("whisper-api") < commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
         assert "'stop', 'ollama'" in commands and "'stop', 'ollama-download'" in commands
     if precheck_failed or client_build_exit:
         assert "whisper-api" not in commands

@@ -1,5 +1,5 @@
 # Лёгкий клиент: не содержит моделей и не получает доступ к GPU.
-ARG PYTHON_IMAGE=python:3.13-slim-bookworm
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 FROM ${PYTHON_IMAGE}
 RUN apt-get -o APT::Update::Error-Mode=any update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \

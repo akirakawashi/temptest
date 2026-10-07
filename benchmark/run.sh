@@ -56,16 +56,6 @@ bench_compose() {
     docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
         -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" "$@"
 }
-build_benchmark_image() {
-    local image="$1" dockerfile="$2"
-    local options=(--builder=default --network="$BENCH_BUILD_NETWORK" --progress=plain --load
-                   --tag "$image" --file "$BENCH_PROJECT_DIR/$dockerfile")
-    if [[ "$BENCH_BUILD_NETWORK" == host ]]; then
-        options+=(--allow=network.host)
-    fi
-    # Сеть задаётся явно; работоспособность apt проверяется при сборке пакетов.
-    docker buildx build "${options[@]}" "$BENCH_PROJECT_DIR"
-}
 archive_logs_on_host() {
     local temporary_archive
     # Запись внутри исходной папки меняет её во время чтения tar.
@@ -155,7 +145,7 @@ check_capacity() {
 }
 echo "Прогон $BENCH_RUN_ID: весь корпус Whisper API → весь корпус GigaAM; GPU $BENCH_GPU."
 echo "Сеть сборки образов: $BENCH_BUILD_NETWORK."
-echo 'Сборка образов: прямой Buildx, локальный builder default, подробный вывод.'
+echo 'Сборка образов: Docker Compose, подробный вывод.'
 echo "Допустимая загрузка GPU при проверке ресурсов: $BENCH_GPU_MAX_UTIL%."
 if (( BENCH_GPU_MAX_UTIL > 10 )); then
     echo 'Допускается рабочая нагрузка на общей GPU. Времена зависят от других сервисов; проверки памяти сохраняются.'
@@ -166,7 +156,7 @@ if ! check_capacity; then
 fi
 docker compose version
 docker buildx version
-build_benchmark_image speech-comparison:3.0.0-api-client Dockerfile.whisper-client
+bench_compose --progress plain build whisper-client
 BENCH_CLIENT_READY=1
 echo 'Whisper API' > "$BENCH_RUN_OUT/логи/этап.txt"
 gpu_monitor &
@@ -177,7 +167,7 @@ if ! check_capacity; then
     exit 42
 fi
 echo 'Загрузка моделей' > "$BENCH_RUN_OUT/логи/этап.txt"
-build_benchmark_image speech-comparison:2.0.0-cuda Dockerfile.benchmark
+bench_compose --progress plain build compare
 timeout 3600 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
     -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --rm --no-deps --name "$BENCH_PREFETCH_CONTAINER" prefetch
 BENCH_DOWNLOAD_STARTED=1
