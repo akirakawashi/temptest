@@ -184,8 +184,8 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
-@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term", [
-    (*case, False) for case in [
+@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console", [
+    (*case, False, False) for case in [
     (14600, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0, 0, 0),
     (90000, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (14600, 100, 12288, 10, 0, 0, 0, 0, 0, 0),
     (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0), (3000, 100, 12288, 100, 0, 0, 0, 0, 0, 0),
@@ -194,9 +194,10 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 52),
     ]
 ] + [
-    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, True, id="completed-whisper-log-reader-ignores-sigterm"),
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, True, False, id="completed-whisper-log-reader-ignores-sigterm"),
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, True, id="blocked-console-does-not-stop-gigaam"),
 ])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term):
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -214,14 +215,16 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
                       'if a[0] == "compose" and "up" in a and a[-1] == "ollama-download": sys.exit(int(os.environ["OLLAMA_DOWNLOAD_START_EXIT"]))\n'
                       'if a[0] == "compose" and "run" in a: assert sys.stdin.buffer.read(1) == b""\n'
                       'if a[0] == "wait":\n'
-                      ' if os.environ["IGNORE_LOG_TERM"] == "1" and "-client-" in a[-1]:\n'
+                      ' if "-client-" in a[-1] and (os.environ["IGNORE_LOG_TERM"] == "1" or os.environ["BLOCKED_CONSOLE"] == "1"):\n'
                       '  while not Path(os.environ["LOG_READER_READY"]).exists(): time.sleep(0.01)\n'
                       ' print(os.environ["WHISPER_DOWNLOAD_EXIT"] if "-whisper-download-" in a[-1] else os.environ["API_EXIT"] if "-client-" in a[-1] else "0"); sys.exit(0)\n'
                       'if a[0] == "logs" and "--follow" in a:\n'
                       ' if os.environ["IGNORE_LOG_TERM"] == "1" and "-client-" in a[-1]:\n'
                       '  signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
-                      '  Path(os.environ["LOG_READER_READY"]).write_text(str(os.getpid()))\n'
                       ' print("Тест: поток логов открыт после завершения задачи", flush=True)\n'
+                      ' if os.environ["BLOCKED_CONSOLE"] == "1" and "-client-" in a[-1]: print("И" * 1024 * 1024, flush=True)\n'
+                      ' if "-client-" in a[-1] and (os.environ["IGNORE_LOG_TERM"] == "1" or os.environ["BLOCKED_CONSOLE"] == "1"):\n'
+                      '  Path(os.environ["LOG_READER_READY"]).write_text(str(os.getpid()))\n'
                       ' while True: time.sleep(60)\n'
                       'if a[0] == "logs": print("Тест: полный журнал завершённого контейнера")\n'
                       'if "info" in a: print("/tmp")\n'
@@ -233,6 +236,7 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     nvidia.chmod(0o755)
     env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
            "IGNORE_LOG_TERM": "1" if ignore_log_term else "0", "LOG_READER_READY": str(log_reader_ready),
+           "BLOCKED_CONSOLE": "1" if blocked_console else "0",
            "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
            "BENCH_GPU_MAX_UTIL": str(max_util),
            "BENCH_BUILD_NETWORK": "default",
@@ -242,10 +246,12 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
            "WHISPER_DOWNLOAD_EXIT": str(whisper_download_exit), "OLLAMA_DOWNLOAD_START_EXIT": str(ollama_download_start_exit),
            "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     # Вход родительского терминала остаётся открытым; поток Docker logs не даёт EOF.
-    # Завершение контейнера должно перевести прогон дальше независимо от обоих.
+    # Для blocked_console stdout — заполненная труба, которую до выхода никто не читает.
+    # Завершение контейнера должно перевести прогон дальше независимо от вывода.
     with (tmp_path / "terminal.log").open("w+") as terminal:
         process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
-                                   stdin=subprocess.PIPE, stdout=terminal, stderr=subprocess.STDOUT, start_new_session=True)
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE if blocked_console else terminal,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
         try:
             returncode = process.wait(timeout=15)
         finally:
@@ -254,7 +260,13 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
         terminal.seek(0)
-        result = subprocess.CompletedProcess(process.args, returncode, stdout=terminal.read(), stderr="")
+        if blocked_console:
+            console = process.stdout.read().decode("utf-8", errors="replace")
+            process.stdout.close()
+        else:
+            console = terminal.read()
+        launch_log = next((folder / "benchmark-results").glob("*/логи/запуск.log"))
+        result = subprocess.CompletedProcess(process.args, returncode, stdout=launch_log.read_text(), stderr="")
     precheck_failed = free < min_free or util > max_util
     assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)) or ollama_download_start_exit)
     commands = command_log.read_text()
@@ -318,6 +330,11 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         with pytest.raises(ProcessLookupError):
             os.kill(int(log_reader_ready.read_text()), 0)
         assert "Docker сообщил о завершении задачи speech-comparison-client-" in result.stdout
+    if blocked_console:
+        assert log_reader_ready.is_file()
+        assert "И" * 1024 * 1024 in result.stdout
+        assert len(console) < len(result.stdout)
+        assert "Завершение: код 0" in result.stdout
 
 
 @pytest.mark.parametrize("download_network", ["host", "bridge"])

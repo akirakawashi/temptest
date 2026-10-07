@@ -64,7 +64,14 @@ BENCH_WHISPER_DOWNLOAD_CONTAINER="speech-comparison-whisper-download-$BENCH_RUN_
 BENCH_ARTIFACTS_CONTAINER="speech-comparison-artifacts-$BENCH_RUN_ID"
 mkdir -p "$BENCH_CACHE/whisper"
 mkdir -p "$BENCH_RUN_OUT/логи"
-exec > >(tee -i -a "$BENCH_RUN_OUT/логи/запуск.log") 2>&1
+# Запись журнала не должна ждать вывода в SSH/VS Code.
+# Основной процесс пишет прямо в файл; отдельный читатель показывает его в терминале.
+exec 8>&1
+exec >> "$BENCH_RUN_OUT/логи/запуск.log" 2>&1
+timeout --foreground --kill-after=3 0 tail --follow=descriptor --sleep-interval=0.1 \
+    --pid="$$" -n +1 "$BENCH_RUN_OUT/логи/запуск.log" >&8 2>&8 9>&- &
+BENCH_CONSOLE_PID=$!
+exec 8>&-
 BENCH_CLIENT_READY=0
 BENCH_WHISPER_STARTED=0
 BENCH_OLLAMA_STARTED=0
@@ -106,11 +113,14 @@ run_task() {
     BENCH_TASK_LOG_PID=$!
     # limit=0 — весь корпус без общего дедлайна; таймаут есть у каждого ASR-запроса.
     if exit_code=$(timeout --foreground "$limit" docker wait "$container"); then
-        echo "Docker сообщил о завершении задачи $container: код $exit_code; завершаем поток логов."
+        :
     else
         wait_error=$?
     fi
     stop_task_log
+    if (( wait_error == 0 )); then
+        echo "Docker сообщил о завершении задачи $container: код $exit_code; поток логов остановлен."
+    fi
     if ! save_task_log; then
         echo "Не удалось сохранить отдельный лог $container; общий журнал сохранён."
         (( wait_error != 0 )) || wait_error=1
@@ -193,6 +203,10 @@ cleanup() {
         archive_logs_on_host || true
     fi
     rm -rf -- "$BENCH_RUN_OUT/временные"
+    # Даём читателю показать последние строки; зависший терминал не удерживает выход.
+    sleep 0.2
+    kill "$BENCH_CONSOLE_PID" 2>/dev/null || true
+    wait "$BENCH_CONSOLE_PID" 2>/dev/null || true
     exit "$bench_exit_code"
 }
 trap cleanup EXIT
