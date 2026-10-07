@@ -86,7 +86,7 @@ stop_task_log() {
 }
 save_task_log() {
     if [[ -n "$BENCH_TASK_CONTAINER" && -n "$BENCH_TASK_LOG_FILE" ]]; then
-        timeout --foreground 30 docker logs "$BENCH_TASK_CONTAINER" > "$BENCH_TASK_LOG_FILE" 2>&1 || return 1
+        timeout --foreground --kill-after=3 30 docker logs "$BENCH_TASK_CONTAINER" > "$BENCH_TASK_LOG_FILE" 2>&1 || return 1
     fi
 }
 run_task() {
@@ -99,11 +99,14 @@ run_task() {
     timeout --foreground 120 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
         -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --detach -T --interactive=false \
         --no-deps --name "$container" "$@"
-    docker logs --follow "$container" &
+    # SIGTERM у Docker CLI может не завершить заблокированное чтение/вывод.
+    # После остановки задачи даём читателю 3 с, затем завершаем только этот CLI.
+    # 0 отключает общий дедлайн: логи идут всё время работы контейнера.
+    timeout --foreground --kill-after=3 0 docker logs --follow "$container" &
     BENCH_TASK_LOG_PID=$!
     # limit=0 — весь корпус без общего дедлайна; таймаут есть у каждого ASR-запроса.
     if exit_code=$(timeout --foreground "$limit" docker wait "$container"); then
-        :
+        echo "Docker сообщил о завершении задачи $container: код $exit_code; завершаем поток логов."
     else
         wait_error=$?
     fi
