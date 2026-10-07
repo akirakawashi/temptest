@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Только собственный стенд; whisper-asr/model-proxy/vLLM не управляются.
 set -euo pipefail
+# Скрипт не читает команды с клавиатуры; Ctrl+C по-прежнему доставляется сигналом.
+exec </dev/null
 if [[ $# -lt 1 || ! -d "$1" ]]; then
     echo 'Использование: bash benchmark/run.sh /путь/к/записям [параметры прогона]' >&2
     exit 2
@@ -68,9 +70,61 @@ BENCH_WHISPER_STARTED=0
 BENCH_OLLAMA_STARTED=0
 BENCH_DOWNLOAD_STARTED=0
 BENCH_MONITOR_PID=''
+BENCH_TASK_LOG_PID=''
+BENCH_TASK_CONTAINER=''
+BENCH_TASK_LOG_FILE=''
 bench_compose() {
     docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
         -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" "$@"
+}
+stop_task_log() {
+    if [[ -n "$BENCH_TASK_LOG_PID" ]]; then
+        kill "$BENCH_TASK_LOG_PID" 2>/dev/null || true
+        wait "$BENCH_TASK_LOG_PID" 2>/dev/null || true
+        BENCH_TASK_LOG_PID=''
+    fi
+}
+save_task_log() {
+    if [[ -n "$BENCH_TASK_CONTAINER" && -n "$BENCH_TASK_LOG_FILE" ]]; then
+        timeout --foreground 30 docker logs "$BENCH_TASK_CONTAINER" > "$BENCH_TASK_LOG_FILE" 2>&1 || return 1
+    fi
+}
+run_task() {
+    local limit="$1" container="$2" task_log="$3" exit_code wait_error=0
+    shift 3
+    BENCH_TASK_CONTAINER="$container"
+    BENCH_TASK_LOG_FILE="$BENCH_RUN_OUT/логи/$task_log"
+    echo "Запуск задачи $container; управление по статусу контейнера, логи в терминале."
+    # Compose только создаёт/запускает задачу. Завершение читаем через Docker wait.
+    timeout --foreground 120 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
+        -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --detach -T --interactive=false \
+        --no-deps --name "$container" "$@"
+    docker logs --follow "$container" &
+    BENCH_TASK_LOG_PID=$!
+    # limit=0 — весь корпус без общего дедлайна; таймаут есть у каждого ASR-запроса.
+    if exit_code=$(timeout --foreground "$limit" docker wait "$container"); then
+        :
+    else
+        wait_error=$?
+    fi
+    stop_task_log
+    if ! save_task_log; then
+        echo "Не удалось сохранить отдельный лог $container; общий журнал сохранён."
+        (( wait_error != 0 )) || wait_error=1
+    fi
+    if (( wait_error != 0 )); then
+        echo "Ожидание задачи $container не завершено: код $wait_error; останавливаем стенд."
+        return "$wait_error"
+    fi
+    [[ "$exit_code" =~ ^[0-9]{1,3}$ ]] && (( 10#$exit_code <= 255 )) || {
+        echo "Docker вернул некорректный код завершения задачи $container: $exit_code"
+        return 1
+    }
+    exit_code=$((10#$exit_code))
+    echo "Задача $container завершена: код $exit_code."
+    BENCH_TASK_CONTAINER=''
+    BENCH_TASK_LOG_FILE=''
+    return "$exit_code"
 }
 stop_test_whisper() {
     if (( BENCH_WHISPER_STARTED )); then
@@ -98,6 +152,7 @@ archive_logs_on_host() {
 cleanup() {
     local bench_exit_code=$?
     trap - EXIT
+    stop_task_log
     if [[ -n "$BENCH_MONITOR_PID" ]]; then
         kill "$BENCH_MONITOR_PID" 2>/dev/null || true
         wait "$BENCH_MONITOR_PID" 2>/dev/null || true
@@ -106,6 +161,7 @@ cleanup() {
     docker stop --time 10 "$BENCH_PREFETCH_CONTAINER" >/dev/null 2>&1 || true
     docker stop --time 10 "$BENCH_CLIENT_CONTAINER" >/dev/null 2>&1 || true
     docker stop --time 10 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" >/dev/null 2>&1 || true
+    save_task_log || true
     stop_test_whisper || true
     if (( BENCH_OLLAMA_STARTED )); then
         bench_compose stop ollama || true
@@ -178,10 +234,10 @@ check_capacity() {
     echo "Проверка ресурсов: GPU свободно $free_gpu МиБ, загрузка $util%, RAM $free_ram МиБ."
     [[ "$free_gpu" =~ ^[0-9]+$ && "$util" =~ ^[0-9]+$ && "$free_ram" =~ ^[0-9]+$ ]] || return 1
     (( free_gpu >= BENCH_MIN_FREE && util <= BENCH_GPU_MAX_UTIL && free_ram >= BENCH_MIN_RAM )) || return 1
-    docker_root=$(docker info --format '{{.DockerRootDir}}') || return 1
+    docker_root=$(timeout 30 docker info --format '{{.DockerRootDir}}') || return 1
     [[ -d "$docker_root" ]] || return 1
     for directory in "$BENCH_OUT" "$BENCH_CACHE" "$docker_root"; do
-        free_disk=$(df -Pm "$directory" | awk 'NR==2 {print $4}')
+        free_disk=$(timeout 30 df -Pm "$directory" | awk 'NR==2 {print $4}') || return 1
         echo "Диск $directory: свободно $free_disk МиБ; минимум $BENCH_MIN_DISK МиБ."
         [[ "$free_disk" =~ ^[0-9]+$ ]] && (( free_disk >= BENCH_MIN_DISK )) || return 1
     done
@@ -205,21 +261,25 @@ docker buildx version
 bench_compose --progress plain build whisper-client
 BENCH_CLIENT_READY=1
 echo 'Подготовка Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
-gpu_monitor &
+(
+    # Завершение монитора не должно вызывать cleanup всего прогона второй раз.
+    trap - EXIT
+    trap 'exit 0' TERM INT
+    gpu_monitor
+) &
 BENCH_MONITOR_PID=$!
-timeout 3600 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
-    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --no-deps \
-    --name "$BENCH_WHISPER_DOWNLOAD_CONTAINER" whisper-download \
-    2>&1 | tee -i "$BENCH_RUN_OUT/логи/загрузка-whisper.log"
+run_task 3600 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" загрузка-whisper.log whisper-download
+echo 'Загрузка Whisper завершена; проверяем ресурсы перед запуском GPU-сервера.'
 if ! check_capacity; then
     echo 'Ресурсы изменились за время подготовки; тестовый Whisper не запускается'
     exit 42
 fi
 echo 'Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
 BENCH_WHISPER_STARTED=1
+echo 'Запускаем тестовый Whisper на GPU; ожидание готовности до 600 секунд.'
 bench_compose up -d --wait --wait-timeout 600 whisper-bench
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
-bench_compose run --no-deps --name "$BENCH_CLIENT_CONTAINER" whisper-client "$@" \
+run_task 0 "$BENCH_CLIENT_CONTAINER" whisper-клиент.log whisper-client "$@" \
     --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
 stop_test_whisper
 echo 'Whisper завершён' > "$BENCH_RUN_OUT/логи/этап.txt"
@@ -230,13 +290,11 @@ if ! check_capacity; then
 fi
 echo 'Загрузка моделей' > "$BENCH_RUN_OUT/логи/этап.txt"
 bench_compose --progress plain build compare
-timeout 3600 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
-    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --no-deps --name "$BENCH_PREFETCH_CONTAINER" prefetch \
-    2>&1 | tee -i "$BENCH_RUN_OUT/логи/загрузка-gigaam.log"
+run_task 3600 "$BENCH_PREFETCH_CONTAINER" загрузка-gigaam.log prefetch
 BENCH_DOWNLOAD_STARTED=1
 bench_compose up -d --wait --wait-timeout 60 ollama-download
 timeout 7200 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
-    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" exec -T ollama-download sh -c \
+    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" exec --interactive=false -T ollama-download sh -c \
     'exec ollama pull "$LLM_MODEL"' \
     2>&1 | tee -i "$BENCH_RUN_OUT/логи/загрузка-llm.log"
 bench_compose stop ollama-download
@@ -248,6 +306,6 @@ echo 'GigaAM' > "$BENCH_RUN_OUT/логи/этап.txt"
 BENCH_OLLAMA_STARTED=1
 bench_compose up -d ollama
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
-bench_compose run --no-deps --name "$BENCH_GIGA_CONTAINER" compare "$@" --phase gigaam --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+run_task 0 "$BENCH_GIGA_CONTAINER" gigaam-контейнер.log compare "$@" --phase gigaam --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
 echo "Результаты: $BENCH_RUN_OUT/отчёт.html"

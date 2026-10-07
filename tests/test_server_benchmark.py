@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -201,14 +202,20 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     bin_dir.mkdir()
     command_log = tmp_path / "commands.log"
     docker = bin_dir / "docker"
-    docker.write_text('#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\nwith open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
+    docker.write_text('#!/usr/bin/env python3\nimport os,sys,time\na=sys.argv[1:]\nwith open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
                       'if a[0] == "compose" and "build" in a and a[-1] == "whisper-client": sys.exit(int(os.environ["CLIENT_BUILD_EXIT"]))\n'
                       'if a[0] == "compose" and "up" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_START_EXIT"]))\n'
                       'if a[0] == "compose" and "stop" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_STOP_EXIT"]))\n'
-                      'if a[0] == "compose" and "run" in a and a[-1] == "whisper-download": sys.exit(int(os.environ["WHISPER_DOWNLOAD_EXIT"]))\n'
                       'if a[0] == "compose" and "up" in a and a[-1] == "ollama-download": sys.exit(int(os.environ["OLLAMA_DOWNLOAD_START_EXIT"]))\n'
+                      'if a[0] == "compose" and "run" in a: assert sys.stdin.buffer.read(1) == b""\n'
+                      'if a[0] == "wait":\n'
+                      ' print(os.environ["WHISPER_DOWNLOAD_EXIT"] if "-whisper-download-" in a[-1] else os.environ["API_EXIT"] if "-client-" in a[-1] else "0"); sys.exit(0)\n'
+                      'if a[0] == "logs" and "--follow" in a:\n'
+                      ' print("Тест: поток логов открыт после завершения задачи", flush=True)\n'
+                      ' while True: time.sleep(60)\n'
+                      'if a[0] == "logs": print("Тест: полный журнал завершённого контейнера")\n'
                       'if "info" in a: print("/tmp")\n'
-                      'sys.exit(int(os.environ["API_EXIT"]) if "whisper-api" in a else 0)\n')
+                      'sys.exit(0)\n')
     nvidia = bin_dir / "nvidia-smi"
     nvidia.write_text('#!/usr/bin/env python3\nimport os,sys\na=" ".join(sys.argv)\n'
                       'print(os.environ["FREE_GPU"] if "--query-gpu=memory.free" in a else os.environ["GPU_UTIL"] if "--query-gpu=utilization.gpu" in a else "2026/10/07, uuid, 0, 1000, 90000, 95830, 80, 32")\n')
@@ -223,8 +230,20 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
            "WHISPER_START_EXIT": str(whisper_start_exit), "WHISPER_STOP_EXIT": str(whisper_stop_exit),
            "WHISPER_DOWNLOAD_EXIT": str(whisper_download_exit), "OLLAMA_DOWNLOAD_START_EXIT": str(ollama_download_start_exit),
            "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
-    result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
-                            capture_output=True, text=True, timeout=15)
+    # Вход родительского терминала остаётся открытым; поток Docker logs не даёт EOF.
+    # Завершение контейнера должно перевести прогон дальше независимо от обоих.
+    with (tmp_path / "terminal.log").open("w+") as terminal:
+        process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
+                                   stdin=subprocess.PIPE, stdout=terminal, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            returncode = process.wait(timeout=15)
+        finally:
+            process.stdin.close()
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        terminal.seek(0)
+        result = subprocess.CompletedProcess(process.args, returncode, stdout=terminal.read(), stderr="")
     precheck_failed = free < min_free or util > max_util
     assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)) or ollama_download_start_exit)
     commands = command_log.read_text()
@@ -249,15 +268,22 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         assert "--wait" in download_up and "--wait-timeout" in download_up
         assert "'stop', 'ollama-download'" in commands
         if ollama_download_start_exit:
-            assert "'exec', '-T', 'ollama-download'" not in commands
+            assert "'exec', '--interactive=false', '-T', 'ollama-download'" not in commands
             assert "'up', '-d', 'ollama'" not in commands
         else:
             assert commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
             assert "'stop', 'ollama'" in commands
+            waits = [ast.literal_eval(line) for line in commands.splitlines()
+                     if ast.literal_eval(line)[0] == "wait"]
+            assert len(waits) == 4
+            assert all(task[1].startswith(prefix) for task, prefix in zip(waits, (
+                "speech-comparison-whisper-download-", "speech-comparison-client-",
+                "speech-comparison-prefetch-", "speech-comparison-gigaam-"), strict=True))
     if whisper_download_exit:
         assert "whisper-api" not in commands and "'up', '-d', '--wait', '--wait-timeout', '600', 'whisper-bench'" not in commands
         download_logs = list((folder / "benchmark-results").glob("*/логи/загрузка-whisper.log"))
         assert len(download_logs) == 1
+        assert "полный журнал завершённого контейнера" in download_logs[0].read_text()
     if precheck_failed or client_build_exit:
         assert "whisper-api" not in commands
         assert "file changed as we read it" not in result.stdout + result.stderr
@@ -273,6 +299,8 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         command = ast.literal_eval(line)
         assert "--rm" not in command and "--remove-orphans" not in command
         assert "rm" not in command and "down" not in command
+        if command[0] == "compose" and "run" in command:
+            assert "--detach" in command and "--interactive=false" in command and "-T" in command
     assert "10.220.21.2" not in commands and "WHISPER_API_KEY" not in commands
 
 
