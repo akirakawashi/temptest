@@ -14,10 +14,20 @@ export BENCH_OUT="${BENCH_OUT:-$BENCH_PROJECT_DIR/benchmark-results}"
 export BENCH_CACHE="${BENCH_CACHE:-$BENCH_PROJECT_DIR/benchmark-cache}"
 export BENCH_THREADS="${BENCH_THREADS:-4}"
 export BENCH_GPU="${BENCH_GPU:-0}"
+export BENCH_BUILD_NETWORK="${BENCH_BUILD_NETWORK:-default}"
+case "$BENCH_BUILD_NETWORK" in
+    default|host) ;;
+    *) echo 'BENCH_BUILD_NETWORK должен быть default или host' >&2; exit 2 ;;
+esac
 export BENCH_CPUSET="${BENCH_CPUSET:-0-3}"
 export BENCH_UID="$(id -u)"
 export BENCH_GID="$(id -g)"
 BENCH_MIN_FREE="${BENCH_GPU_MIN_FREE_MIB:-16384}"
+export BENCH_GPU_MAX_UTIL="${BENCH_GPU_MAX_UTIL:-10}"
+[[ "$BENCH_GPU_MAX_UTIL" =~ ^[0-9]{1,3}$ ]] && (( 10#$BENCH_GPU_MAX_UTIL <= 100 )) || {
+    echo 'BENCH_GPU_MAX_UTIL должен быть целым числом от 0 до 100' >&2; exit 2;
+}
+export BENCH_GPU_MAX_UTIL=$((10#$BENCH_GPU_MAX_UTIL))
 export BENCH_GPU_RESERVE_MIB="${BENCH_GPU_RESERVE_MIB:-4096}"
 BENCH_MIN_RAM="${BENCH_MIN_RAM_MIB:-20480}"
 BENCH_MIN_DISK="${BENCH_MIN_DISK_MIB:-32768}"
@@ -124,7 +134,7 @@ check_capacity() {
     free_ram=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
     echo "Перед GigaAM: GPU свободно $free_gpu МиБ, загрузка $util%, RAM $free_ram МиБ."
     [[ "$free_gpu" =~ ^[0-9]+$ && "$util" =~ ^[0-9]+$ && "$free_ram" =~ ^[0-9]+$ ]] || return 1
-    (( free_gpu >= BENCH_MIN_FREE && util <= 10 && free_ram >= BENCH_MIN_RAM )) || return 1
+    (( free_gpu >= BENCH_MIN_FREE && util <= BENCH_GPU_MAX_UTIL && free_ram >= BENCH_MIN_RAM )) || return 1
     docker_root=$(docker info --format '{{.DockerRootDir}}') || return 1
     [[ -d "$docker_root" ]] || return 1
     for directory in "$BENCH_OUT" "$BENCH_CACHE" "$docker_root"; do
@@ -134,8 +144,13 @@ check_capacity() {
     done
 }
 echo "Прогон $BENCH_RUN_ID: весь корпус Whisper API → весь корпус GigaAM; GPU $BENCH_GPU."
+echo "Сеть сборки образов: $BENCH_BUILD_NETWORK."
+echo "Допустимая загрузка GPU при проверке ресурсов: $BENCH_GPU_MAX_UTIL%."
+if (( BENCH_GPU_MAX_UTIL > 10 )); then
+    echo 'Допускается рабочая нагрузка на общей GPU. Времена зависят от других сервисов; проверки памяти сохраняются.'
+fi
 if ! check_capacity; then
-    echo "Стенд не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ 10%, RAM ≥ $BENCH_MIN_RAM МиБ, диск ≥ $BENCH_MIN_DISK МиБ. Запросов Whisper не было."
+    echo "Стенд не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ, диск ≥ $BENCH_MIN_DISK МиБ. Запросов Whisper не было."
     exit 42
 fi
 bench_compose build whisper-client
@@ -145,7 +160,7 @@ gpu_monitor &
 BENCH_MONITOR_PID=$!
 bench_compose run --rm --no-deps whisper-client --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID" "$@"
 if ! check_capacity; then
-    echo "GigaAM не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ 10%, RAM ≥ $BENCH_MIN_RAM МиБ. Результаты Whisper сохранены."
+    echo "GigaAM не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ. Результаты Whisper сохранены."
     exit 42
 fi
 echo 'Загрузка моделей' > "$BENCH_RUN_OUT/логи/этап.txt"

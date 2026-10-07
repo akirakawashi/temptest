@@ -6,6 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.whisper-client
+      network: ${BENCH_BUILD_NETWORK:-default}
     image: speech-comparison:3.0.0-api-client
     user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
     cpus: "${BENCH_THREADS:-4}"
@@ -15,6 +16,7 @@ services:
       BENCH_THREADS: ${BENCH_THREADS:-4}
       BENCH_GPU: ${BENCH_GPU:-0}
       BENCH_GPU_MIN_FREE_MIB: ${BENCH_GPU_MIN_FREE_MIB:-16384}
+      BENCH_GPU_MAX_UTIL: ${BENCH_GPU_MAX_UTIL:-10}
       BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
       BENCH_MIN_RAM_MIB: ${BENCH_MIN_RAM_MIB:-20480}
       WHISPER_API_BASE_URL: ${WHISPER_API_BASE_URL:-http://10.220.21.2:8002/v1}
@@ -32,6 +34,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.benchmark
+      network: ${BENCH_BUILD_NETWORK:-default}
     image: speech-comparison:2.0.0-cuda
     platform: linux/amd64
     user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"

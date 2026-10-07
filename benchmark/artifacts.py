@@ -96,6 +96,8 @@ def render(output: Path, rows: list, conditions: dict):
             f'Записей: {len(rows)}, успешных пар: {len(pairs)}.</p><p>{percent}</p>'
             '<p>Whisper: HTTP-запрос включает передачу аудио, очередь и ответ. GigaAM: локальный конвейер после прогрева. '
             'Рабочий Whisper остаётся запущенным. Скорость не является оценкой точности.</p>'
+            '<p>GPU общая с рабочими сервисами. Их нагрузка влияет на время обеих фаз; '
+            'график GPU показывает суммарную загрузку всех процессов.</p>'
             + ''.join(f'<div class="chart">{svg}</div>' for svg in charts.values()) + '</html>')
     (output / "отчёт.html").write_text(html, encoding="utf-8")
 

@@ -172,11 +172,12 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
-@pytest.mark.parametrize("free, util, min_free, api_exit", [
-    (14600, 0, 16384, 0), (90000, 0, 16384, 47), (90000, 0, 16384, 0),
-    (14600, 100, 12288, 0),
+@pytest.mark.parametrize("free, util, min_free, max_util, api_exit", [
+    (14600, 0, 16384, 10, 0), (90000, 0, 16384, 10, 47), (90000, 0, 16384, 10, 0),
+    (14600, 100, 12288, 10, 0), (14600, 100, 12288, 100, 0),
+    (3000, 100, 12288, 100, 0),
 ])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, api_exit):
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -196,10 +197,11 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     nvidia.chmod(0o755)
     env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
            "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
+           "BENCH_GPU_MAX_UTIL": str(max_util),
            "API_EXIT": str(api_exit), "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
                             capture_output=True, text=True, timeout=15)
-    precheck_failed = free < min_free or util > 10
+    precheck_failed = free < min_free or util > max_util
     assert result.returncode == (42 if precheck_failed else api_exit)
     commands = command_log.read_text()
     assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands

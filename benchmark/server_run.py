@@ -51,7 +51,7 @@ async def whisper_phase(args) -> int:
                              "gigaam": "Полный локальный цикл и отдельно сумма ASR; загрузка и прогрев исключены"},
                   "production_service_management": False, "gigaam_external_network": False}
     conditions["guard_policy"] = {key: os.environ.get(key) for key in
-                                  ("BENCH_GPU_MIN_FREE_MIB", "BENCH_GPU_RESERVE_MIB", "BENCH_MIN_RAM_MIB")}
+                                  ("BENCH_GPU_MIN_FREE_MIB", "BENCH_GPU_MAX_UTIL", "BENCH_GPU_RESERVE_MIB", "BENCH_MIN_RAM_MIB")}
     rows, client = [], None
     try:
         if len(files) != args.expected_files:
