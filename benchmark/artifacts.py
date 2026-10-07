@@ -95,7 +95,8 @@ def render(output: Path, rows: list, conditions: dict):
             f'<h1>Сравнение Whisper API и GigaAM</h1><p>Состояние: {escape(conditions["state"])}. '
             f'Записей: {len(rows)}, успешных пар: {len(pairs)}.</p><p>{percent}</p>'
             '<p>Whisper: HTTP-запрос включает передачу аудио, очередь и ответ. GigaAM: локальный конвейер после прогрева. '
-            'Рабочий Whisper остаётся запущенным. Скорость не является оценкой точности.</p>'
+            'Тестовый Whisper останавливается перед GigaAM. Продовые контейнеры не управляются; GPU общая. '
+            'Скорость не является оценкой точности.</p>'
             '<p>GPU общая с рабочими сервисами. Их нагрузка влияет на время обеих фаз; '
             'график GPU показывает суммарную загрузку всех процессов.</p>'
             + ''.join(f'<div class="chart">{svg}</div>' for svg in charts.values()) + '</html>')
@@ -115,7 +116,7 @@ def finalize(output: Path, exit_code: int):
             conditions["state"] = "Остановлен запуском стенда; причина в логи/запуск.log"
         rows = load_rows(output, conditions)
         write_json(manifest, conditions)
-        save_reports(output, rows, conditions["state"], mode="api")
+        save_reports(output, rows, conditions["state"], mode="standalone-api" if conditions.get("mode") == "isolated_whisper_then_gigaam" else "api")
         render(output, rows, conditions)
     temporary = output / "временные"
     if temporary.is_dir():

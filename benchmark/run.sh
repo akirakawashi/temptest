@@ -46,15 +46,31 @@ case "$BENCH_CACHE/" in "$BENCH_AUDIO_DIR/"*) echo 'Кеш должен быть
 BENCH_RUN_OUT="$BENCH_OUT/$BENCH_RUN_ID"
 BENCH_GIGA_CONTAINER="speech-comparison-gigaam-$BENCH_RUN_ID"
 BENCH_PREFETCH_CONTAINER="speech-comparison-prefetch-$BENCH_RUN_ID"
+BENCH_CLIENT_CONTAINER="speech-comparison-client-$BENCH_RUN_ID"
+BENCH_WHISPER_DOWNLOAD_CONTAINER="speech-comparison-whisper-download-$BENCH_RUN_ID"
+BENCH_ARTIFACTS_CONTAINER="speech-comparison-artifacts-$BENCH_RUN_ID"
+mkdir -p "$BENCH_CACHE/whisper"
 mkdir -p "$BENCH_RUN_OUT/логи"
 exec > >(tee -i -a "$BENCH_RUN_OUT/логи/запуск.log") 2>&1
 BENCH_CLIENT_READY=0
+BENCH_WHISPER_STARTED=0
 BENCH_OLLAMA_STARTED=0
 BENCH_DOWNLOAD_STARTED=0
 BENCH_MONITOR_PID=''
 bench_compose() {
     docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
         -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" "$@"
+}
+stop_test_whisper() {
+    if (( BENCH_WHISPER_STARTED )); then
+        if ! bench_compose stop whisper-bench; then
+            bench_compose logs --no-color --since "$BENCH_STARTED_AT" whisper-bench > "$BENCH_RUN_OUT/логи/whisper-сервер.log" 2>&1 || true
+            return 1
+        fi
+        bench_compose logs --no-color --since "$BENCH_STARTED_AT" whisper-bench > "$BENCH_RUN_OUT/логи/whisper-сервер.log" 2>&1 || true
+        BENCH_WHISPER_STARTED=0
+        echo 'Тестовый Whisper остановлен; контейнер сохранён, GPU-память освобождается' | tee "$BENCH_RUN_OUT/логи/тестовый-whisper-остановлен.txt"
+    fi
 }
 archive_logs_on_host() {
     local temporary_archive
@@ -77,19 +93,26 @@ cleanup() {
     fi
     docker stop --time 10 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
     docker stop --time 10 "$BENCH_PREFETCH_CONTAINER" >/dev/null 2>&1 || true
+    docker stop --time 10 "$BENCH_CLIENT_CONTAINER" >/dev/null 2>&1 || true
+    docker stop --time 10 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" >/dev/null 2>&1 || true
+    stop_test_whisper || true
     if (( BENCH_OLLAMA_STARTED )); then
-        bench_compose logs --no-color --since "$BENCH_STARTED_AT" ollama > "$BENCH_RUN_OUT/логи/ollama.log" 2>&1 || true
         bench_compose stop ollama || true
-        bench_compose rm -f ollama || true
+        bench_compose logs --no-color --since "$BENCH_STARTED_AT" ollama > "$BENCH_RUN_OUT/логи/ollama.log" 2>&1 || true
     fi
     if (( BENCH_DOWNLOAD_STARTED )); then
         bench_compose logs --no-color --since "$BENCH_STARTED_AT" ollama-download > "$BENCH_RUN_OUT/логи/загрузка-ollama.log" 2>&1 || true
         bench_compose stop ollama-download || true
-        bench_compose rm -f ollama-download || true
     fi
-    echo "Завершение: код $bench_exit_code. Рабочий Whisper не управляется."
+    # Останавливаем только контейнеры текущего прогона, сохраняя их и сети.
+    echo 'Автоматическое удаление отключено: контейнеры, сети, кеши и результаты сохранены.'
+    echo "Завершение: код $bench_exit_code. Продовые контейнеры не управляются."
     if (( BENCH_CLIENT_READY )); then
-        if ! bench_compose run --rm --no-deps --entrypoint python whisper-client -m benchmark.artifacts \
+        # Отчёт не требует сети/GPU; его завершённый контейнер также сохраняется.
+        if ! docker run --name "$BENCH_ARTIFACTS_CONTAINER" --network none \
+            --memory 2g --cpus 1 --user "$BENCH_UID:$BENCH_GID" --env TZ=Europe/Moscow \
+            --volume "$BENCH_OUT:/results" --entrypoint python \
+            speech-comparison:4.0.0-whisper-standalone -m benchmark.artifacts \
             "/results/$BENCH_RUN_ID" --exit-code "$bench_exit_code"; then
             echo 'Не удалось завершить отчёт контейнером; сохраняем архив журналов на хосте'
             archive_logs_on_host || true
@@ -99,7 +122,7 @@ cleanup() {
         archive_logs_on_host || true
     fi
     rm -rf -- "$BENCH_RUN_OUT/временные"
-    return "$bench_exit_code"
+    exit "$bench_exit_code"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -107,32 +130,40 @@ trap 'exit 143' TERM
 gpu_monitor() {
     echo 'timestamp, uuid, utilization_percent, used_mib, free_mib, total_mib, power_w, temperature_c, phase' > "$BENCH_RUN_OUT/логи/gpu.csv"
     while true; do
-        local sample phase free
+        local sample phase free reason
+        free=''
+        reason=''
         phase="$(cat "$BENCH_RUN_OUT/логи/этап.txt" 2>/dev/null || true)"
-        if sample=$(nvidia-smi -i "$BENCH_GPU" --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.free,memory.total,power.draw,temperature.gpu --format=csv,noheader,nounits 2>>"$BENCH_RUN_OUT/логи/gpu-ошибки.log"); then
+        if sample=$(timeout 10 nvidia-smi -i "$BENCH_GPU" --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.free,memory.total,power.draw,temperature.gpu --format=csv,noheader,nounits 2>>"$BENCH_RUN_OUT/логи/gpu-ошибки.log"); then
             echo "$sample, $phase" >> "$BENCH_RUN_OUT/логи/gpu.csv"
             free=$(awk -F, '{gsub(/ /,"",$5); print $5}' <<< "$sample")
-            if [[ "$phase" == 'GigaAM' && "$free" =~ ^[0-9]+$ ]] && (( free < BENCH_GPU_RESERVE_MIB )); then
-                echo "Резерв GPU нарушен: свободно $free МиБ, минимум $BENCH_GPU_RESERVE_MIB. Останавливаем только стенд." | tee "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt"
-                docker stop --time 5 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
-                bench_compose stop ollama >/dev/null 2>&1 || true
+        fi
+        if [[ "$phase" == 'GigaAM' || "$phase" == 'Whisper' ]]; then
+            if [[ ! "$free" =~ ^[0-9]+$ ]]; then
+                reason='Не удалось проверить свободную память GPU; останавливаем только стенд'
+            elif (( free < BENCH_GPU_RESERVE_MIB )); then
+                reason="Резерв GPU нарушен: свободно $free МиБ, минимум $BENCH_GPU_RESERVE_MIB. Останавливаем только стенд."
+            fi
+            if [[ -n "$reason" ]]; then
+                echo "$reason" | tee "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt"
+                if [[ "$phase" == 'Whisper' ]]; then
+                    bench_compose stop whisper-bench >/dev/null 2>&1 || true
+                else
+                    docker stop --time 5 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
+                    bench_compose stop ollama >/dev/null 2>&1 || true
+                fi
                 return
             fi
-        elif [[ "$phase" == 'GigaAM' ]]; then
-            echo 'Не удалось проверить GPU; останавливаем только стенд' > "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt"
-            docker stop --time 5 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
-            bench_compose stop ollama >/dev/null 2>&1 || true
-            return
         fi
         sleep 2
     done
 }
 check_capacity() {
     local free_gpu util free_ram docker_root free_disk directory
-    free_gpu=$(nvidia-smi -i "$BENCH_GPU" --query-gpu=memory.free --format=csv,noheader,nounits)
-    util=$(nvidia-smi -i "$BENCH_GPU" --query-gpu=utilization.gpu --format=csv,noheader,nounits)
+    free_gpu=$(timeout 10 nvidia-smi -i "$BENCH_GPU" --query-gpu=memory.free --format=csv,noheader,nounits) || return 1
+    util=$(timeout 10 nvidia-smi -i "$BENCH_GPU" --query-gpu=utilization.gpu --format=csv,noheader,nounits) || return 1
     free_ram=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
-    echo "Перед GigaAM: GPU свободно $free_gpu МиБ, загрузка $util%, RAM $free_ram МиБ."
+    echo "Проверка ресурсов: GPU свободно $free_gpu МиБ, загрузка $util%, RAM $free_ram МиБ."
     [[ "$free_gpu" =~ ^[0-9]+$ && "$util" =~ ^[0-9]+$ && "$free_ram" =~ ^[0-9]+$ ]] || return 1
     (( free_gpu >= BENCH_MIN_FREE && util <= BENCH_GPU_MAX_UTIL && free_ram >= BENCH_MIN_RAM )) || return 1
     docker_root=$(docker info --format '{{.DockerRootDir}}') || return 1
@@ -143,7 +174,8 @@ check_capacity() {
         [[ "$free_disk" =~ ^[0-9]+$ ]] && (( free_disk >= BENCH_MIN_DISK )) || return 1
     done
 }
-echo "Прогон $BENCH_RUN_ID: весь корпус Whisper API → весь корпус GigaAM; GPU $BENCH_GPU."
+echo "Прогон $BENCH_RUN_ID: собственный Whisper → остановка Whisper → полный GigaAM; GPU $BENCH_GPU."
+echo 'Адрес Whisper: только whisper-bench:9000 внутри стенда. API и ключи прода не используются.'
 echo "Сеть сборки образов: $BENCH_BUILD_NETWORK."
 echo 'Сборка образов: Docker Compose, подробный вывод.'
 echo "Допустимая загрузка GPU при проверке ресурсов: $BENCH_GPU_MAX_UTIL%."
@@ -158,10 +190,25 @@ docker compose version
 docker buildx version
 bench_compose --progress plain build whisper-client
 BENCH_CLIENT_READY=1
-echo 'Whisper API' > "$BENCH_RUN_OUT/логи/этап.txt"
+echo 'Подготовка Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
 gpu_monitor &
 BENCH_MONITOR_PID=$!
-bench_compose run --rm --no-deps whisper-client --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID" "$@"
+timeout 3600 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
+    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --no-deps \
+    --name "$BENCH_WHISPER_DOWNLOAD_CONTAINER" whisper-download
+if ! check_capacity; then
+    echo 'Ресурсы изменились за время подготовки; тестовый Whisper не запускается'
+    exit 42
+fi
+echo 'Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
+BENCH_WHISPER_STARTED=1
+bench_compose up -d --wait --wait-timeout 600 whisper-bench
+[[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
+bench_compose run --no-deps --name "$BENCH_CLIENT_CONTAINER" whisper-client "$@" \
+    --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+stop_test_whisper
+echo 'Whisper завершён' > "$BENCH_RUN_OUT/логи/этап.txt"
+[[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
 if ! check_capacity; then
     echo "GigaAM не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ. Результаты Whisper сохранены."
     exit 42
@@ -169,7 +216,7 @@ fi
 echo 'Загрузка моделей' > "$BENCH_RUN_OUT/логи/этап.txt"
 bench_compose --progress plain build compare
 timeout 3600 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
-    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --rm --no-deps --name "$BENCH_PREFETCH_CONTAINER" prefetch
+    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --no-deps --name "$BENCH_PREFETCH_CONTAINER" prefetch
 BENCH_DOWNLOAD_STARTED=1
 bench_compose up -d ollama-download
 timeout 7200 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
@@ -184,6 +231,6 @@ echo 'GigaAM' > "$BENCH_RUN_OUT/логи/этап.txt"
 BENCH_OLLAMA_STARTED=1
 bench_compose up -d ollama
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
-bench_compose run --rm --no-deps --name "$BENCH_GIGA_CONTAINER" compare --phase gigaam --audio-dir /recordings --out "/results/$BENCH_RUN_ID" "$@"
+bench_compose run --no-deps --name "$BENCH_GIGA_CONTAINER" compare "$@" --phase gigaam --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
 echo "Результаты: $BENCH_RUN_OUT/отчёт.html"

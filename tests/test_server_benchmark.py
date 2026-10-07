@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from benchmark import artifacts, compare, server_run
-from benchmark.whisper_api import WhisperAPI, speech_seconds, validate_url
+from benchmark.whisper_api import TEST_URL, WhisperAPI, speech_seconds, validate_url
 from test_benchmark import install_fake_runners, write_wav
 
 
@@ -125,8 +125,9 @@ def test_all_whisper_requests_precede_gigaam_and_error_blocks_phase(tmp_path, mo
     api_calls = []
 
     class API:
-        def __init__(self, *args):
-            self.base_url = "http://10.0.0.1/v1"
+        def __init__(self, *args, **kwargs):
+            assert args[0] == TEST_URL and args[1] == "" and kwargs["standalone"] is True
+            self.base_url = TEST_URL
         async def check(self):
             return {"status": "ok"}
         async def health(self):
@@ -135,7 +136,7 @@ def test_all_whisper_requests_precede_gigaam_and_error_blocks_phase(tmp_path, mo
             pass
         async def run(self, path, duration):
             api_calls.append(path.name)
-            return {"status": "error" if failure else "ok", "mode": "existing_server_api", "elapsed_seconds": 1,
+            return {"status": "error" if failure else "ok", "mode": "test_server_api", "elapsed_seconds": 1,
                     "segments": [], "text": "Тест", "speech_seconds": 0, "error": "Ошибка" if failure else None}
 
     async def no_sleep(*args):
@@ -150,7 +151,15 @@ def test_all_whisper_requests_precede_gigaam_and_error_blocks_phase(tmp_path, mo
         with pytest.raises(ValueError):
             asyncio.run(server_run.gigaam_phase(args))
     else:
-        assert len(api_calls) == 2
+        assert len(api_calls) == 3  # Отдельный прогрев, затем две измеряемые записи.
+        assert len(list(output.glob("записи/*/whisper.json"))) == 2
+        conditions = json.loads((output / "условия.json").read_text())
+        assert conditions["whisper"]["warmup"]["included_in_measurements"] is False
+        with pytest.raises(ValueError, match="остановить тестовый Whisper"):
+            asyncio.run(server_run.gigaam_phase(args))
+        assert not calls
+        (output / "логи").mkdir()
+        (output / "логи" / "тестовый-whisper-остановлен.txt").write_text("Остановлен")
         assert asyncio.run(server_run.gigaam_phase(args)) == 0
         assert [name for name, _ in calls] == ["gigaam", "gigaam"]
         assert (output / "отчёт.html").is_file()
@@ -173,12 +182,13 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
-@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit", [
-    (14600, 0, 16384, 10, 0, 0), (90000, 0, 16384, 10, 47, 0), (90000, 0, 16384, 10, 0, 0),
-    (14600, 100, 12288, 10, 0, 0), (14600, 100, 12288, 100, 0, 0),
-    (3000, 100, 12288, 100, 0, 0), (14600, 100, 12288, 100, 0, 23),
+@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit", [
+    (14600, 0, 16384, 10, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0), (90000, 0, 16384, 10, 0, 0, 0, 0),
+    (14600, 100, 12288, 10, 0, 0, 0, 0), (14600, 100, 12288, 100, 0, 0, 0, 0),
+    (3000, 100, 12288, 100, 0, 0, 0, 0), (14600, 100, 12288, 100, 0, 23, 0, 0),
+    (14600, 100, 12288, 100, 0, 0, 31, 0), (14600, 100, 12288, 100, 0, 0, 0, 32),
 ])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit):
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -190,6 +200,8 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     docker = bin_dir / "docker"
     docker.write_text('#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\nwith open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
                       'if a[0] == "compose" and "build" in a and a[-1] == "whisper-client": sys.exit(int(os.environ["CLIENT_BUILD_EXIT"]))\n'
+                      'if a[0] == "compose" and "up" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_START_EXIT"]))\n'
+                      'if a[0] == "compose" and "stop" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_STOP_EXIT"]))\n'
                       'if "info" in a: print("/tmp")\n'
                       'sys.exit(int(os.environ["API_EXIT"]) if "whisper-api" in a else 0)\n')
     nvidia = bin_dir / "nvidia-smi"
@@ -202,11 +214,12 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
            "BENCH_GPU_MAX_UTIL": str(max_util),
            "BENCH_BUILD_NETWORK": "default",
            "API_EXIT": str(api_exit), "CLIENT_BUILD_EXIT": str(client_build_exit),
+           "WHISPER_START_EXIT": str(whisper_start_exit), "WHISPER_STOP_EXIT": str(whisper_stop_exit),
            "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
                             capture_output=True, text=True, timeout=15)
     precheck_failed = free < min_free or util > max_util
-    assert result.returncode == (42 if precheck_failed else client_build_exit or api_exit)
+    assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)))
     commands = command_log.read_text()
     builds = [command for line in commands.splitlines()
               if (command := ast.literal_eval(line))[0] == "compose" and "build" in command]
@@ -218,12 +231,12 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         assert build[-1] in {"whisper-client", "compare"}
     assert "'buildx', 'build'" not in commands
     assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands
-    if precheck_failed or client_build_exit or api_exit:
+    if precheck_failed or client_build_exit or whisper_start_exit or api_exit or whisper_stop_exit:
         assert "'build', 'compare'" not in commands and "'up', '-d', 'ollama'" not in commands
         assert len(builds) == (0 if precheck_failed else 1)
     else:
         assert len(builds) == 2
-        assert commands.index("whisper-api") < commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
+        assert commands.index("whisper-api") < commands.index("'stop', 'whisper-bench'") < commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
         assert "'stop', 'ollama'" in commands and "'stop', 'ollama-download'" in commands
     if precheck_failed or client_build_exit:
         assert "whisper-api" not in commands
@@ -236,3 +249,49 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
             log_text = archive.extractfile("./логи/запуск.log").read().decode()
             assert ("Стенд не запускается" if precheck_failed else f"Завершение: код {client_build_exit}") in log_text
         assert not list((folder / "benchmark-results").glob("*.tar.part"))
+    for line in commands.splitlines():
+        command = ast.literal_eval(line)
+        assert "--rm" not in command and "--remove-orphans" not in command
+        assert "rm" not in command and "down" not in command
+    assert "10.220.21.2" not in commands and "WHISPER_API_KEY" not in commands
+
+
+@pytest.mark.parametrize("url", ["http://10.220.21.2:8002/v1", "http://localhost:9000/v1", "https://api.openai.com/v1"])
+def test_standalone_client_rejects_every_endpoint_except_own_service(url):
+    with pytest.raises(ValueError, match="подключение к проду запрещено"):
+        WhisperAPI(url, "", "large-v3", 10, standalone=True)
+
+
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_standalone_client_verifies_own_service_and_no_production_credentials(tmp_path, device):
+    requests = []
+    path = tmp_path / "тест.wav"
+    write_wav(path, 100)
+
+    def response(request):
+        requests.append(request.url.path)
+        assert request.url.host == "whisper-bench"
+        assert "authorization" not in request.headers
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "large-v3"}]})
+        if request.url.path == "/benchmark/metadata":
+            return httpx.Response(200, json={"stand": "speech-comparison", "model": "large-v3", "device": device,
+                                            "compute_type": "float16", "model_loaded": True})
+        return httpx.Response(200, json={"text": "Тест без ключа", "segments": []})
+
+    async def scenario():
+        client = WhisperAPI(TEST_URL, "", "large-v3", 10, httpx.MockTransport(response), standalone=True)
+        try:
+            if device == "cpu":
+                with pytest.raises(RuntimeError, match="CUDA/float16"):
+                    await client.check()
+            else:
+                await client.check()
+                result = await client.run(path, 0.2)
+                assert result["text"] == "Тест без ключа" and result["mode"] == "test_server_api"
+        finally:
+            await client.close()
+    asyncio.run(scenario())
+    assert ("/v1/audio/transcriptions" in requests) is (device == "cuda")

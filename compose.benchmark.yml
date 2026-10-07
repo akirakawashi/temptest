@@ -7,7 +7,11 @@ services:
       context: .
       dockerfile: Dockerfile.whisper-client
       network: ${BENCH_BUILD_NETWORK:-default}
-    image: speech-comparison:3.0.0-api-client
+      args:
+        WHISPER_IMAGE: ${BENCH_WHISPER_IMAGE:-hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6}
+    image: speech-comparison:4.0.0-whisper-standalone
+    platform: linux/amd64
+    init: true
     user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
     cpus: "${BENCH_THREADS:-4}"
     cpuset: "${BENCH_CPUSET:-0-3}"
@@ -19,9 +23,10 @@ services:
       BENCH_GPU_MAX_UTIL: ${BENCH_GPU_MAX_UTIL:-10}
       BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
       BENCH_MIN_RAM_MIB: ${BENCH_MIN_RAM_MIB:-20480}
-      WHISPER_API_BASE_URL: ${WHISPER_API_BASE_URL:-http://10.220.21.2:8002/v1}
-      WHISPER_API_KEY: ${WHISPER_API_KEY:-}
-      WHISPER_API_MODEL: ${WHISPER_API_MODEL:-large-v3}
+      # Адрес фиксирован: старые URL/ключ прода из .env игнорируются.
+      WHISPER_API_BASE_URL: http://whisper-bench:9000/v1
+      BENCH_WHISPER_MODEL: ${BENCH_WHISPER_MODEL:-large-v3}
+      BENCH_WHISPER_IMAGE: ${BENCH_WHISPER_IMAGE:-hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6}
       BENCH_API_GAP: ${BENCH_API_GAP:-5}
       BENCH_API_TIMEOUT: ${BENCH_API_TIMEOUT:-1200}
       BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
@@ -29,13 +34,83 @@ services:
     volumes:
       - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
       - ${BENCH_OUT:?Укажите папку отчётов}:/results
+    networks: [whisper]
+
+  whisper-bench:
+    image: speech-comparison:4.0.0-whisper-standalone
+    platform: linux/amd64
+    entrypoint: ["python", "-m", "benchmark.whisper_server"]
+    command: []
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: 8g
+    tmpfs:
+      - /tmp:uid=${BENCH_UID:-1000},gid=${BENCH_GID:-1000},mode=0700
+    environment:
+      WHISPER_MODEL: ${BENCH_WHISPER_MODEL:-large-v3}
+      WHISPER_DEVICE: cuda
+      WHISPER_COMPUTE_TYPE: float16
+      WHISPER_LOCAL_ONLY: "1"
+      WHISPER_LANGUAGE: ru
+      WHISPER_THREADS: ${BENCH_WHISPER_THREADS:-2}
+      WHISPER_BEAM: ${BENCH_WHISPER_BEAM:-5}
+      WHISPER_DIARIZATION: "false"
+      WHISPER_WORD_TIMESTAMPS: "false"
+      WHISPER_API_KEY: ""
+      HF_HOME: /var/lib/whisper
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
+      BENCH_WHISPER_IMAGE: ${BENCH_WHISPER_IMAGE:-hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6}
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_CACHE:?Укажите папку кеша моделей}/whisper:/var/lib/whisper:ro
+    networks: [whisper]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health',timeout=3).read()"]
+      interval: 3s
+      timeout: 5s
+      retries: 200
+      start_period: 5s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${BENCH_GPU:-0}"]
+              capabilities: [gpu]
+
+  whisper-download:
+    image: speech-comparison:4.0.0-whisper-standalone
+    platform: linux/amd64
+    entrypoint: ["python", "-m", "benchmark.whisper_server"]
+    command: ["--download"]
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    cpus: "${BENCH_THREADS:-4}"
+    mem_limit: 2g
+    environment:
+      WHISPER_MODEL: ${BENCH_WHISPER_MODEL:-large-v3}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_CACHE:?Укажите папку кеша моделей}/whisper:/var/lib/whisper
 
   compare:
     build:
       context: .
       dockerfile: Dockerfile.benchmark
       network: ${BENCH_BUILD_NETWORK:-default}
-    image: speech-comparison:2.0.0-cuda
+      args:
+        WHISPER_IMAGE: ${BENCH_WHISPER_IMAGE:-hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6}
+    image: speech-comparison:4.0.0-gigaam-cuda
     platform: linux/amd64
     user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
     cpus: "${BENCH_THREADS:-4}"
@@ -105,7 +180,7 @@ services:
               capabilities: [gpu]
 
   prefetch:
-    image: speech-comparison:2.0.0-cuda
+    image: speech-comparison:4.0.0-gigaam-cuda
     user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
     cpus: "${BENCH_THREADS:-4}"
     cpuset: "${BENCH_CPUSET:-0-3}"
@@ -127,6 +202,8 @@ services:
       - comparison-ollama:/root/.ollama
 
 networks:
+  whisper:
+    internal: true
   gigaam:
     internal: true
 

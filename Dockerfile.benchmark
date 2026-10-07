@@ -1,31 +1,27 @@
-# Отдельный NVIDIA CUDA стенд; CPU-образ монитора не нужен.
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm
-FROM ${PYTHON_IMAGE} AS models
-RUN apt-get -o APT::Update::Error-Mode=any update \
- && apt-get install -y --no-install-recommends curl bzip2 ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+# CUDA, Python, curl и декодирование PyAV уже есть в готовом образе Whisper.
+# Сборка не использует apt и не зависит от deb.debian.org.
+ARG WHISPER_IMAGE=hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6
+FROM ${WHISPER_IMAGE} AS models
 COPY scripts/download_models.sh /tmp/download_models.sh
 # GigaAM CUDA скачает официальный PyTorch checkpoint при ручном запуске.
 RUN DOWNLOAD_ASR=0 sh /tmp/download_models.sh /models
 
-FROM ${PYTHON_IMAGE} AS runtime
-RUN apt-get -o APT::Update::Error-Mode=any update \
- && apt-get install -y --no-install-recommends git ca-certificates ffmpeg libgomp1 \
- && rm -rf /var/lib/apt/lists/*
-RUN python -m venv /opt/venv
-ENV PATH=/opt/venv/bin:$PATH \
+FROM ${WHISPER_IMAGE} AS runtime
+# Окружение GigaAM отдельно от библиотек Whisper в базовом образе.
+RUN /usr/bin/python3 -m venv /opt/gigaam-venv
+ENV PATH=/opt/gigaam-venv/bin:$PATH \
     PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
-    MODELS_DIR=/models EMO_CACHE=/cache/gigaam HOME=/tmp \
+    MODELS_DIR=/models EMO_CACHE=/cache/gigaam HOME=/tmp TMPDIR=/tmp \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/venv/lib/python3.12/site-packages/nvidia/curand/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cusparse/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+    LD_LIBRARY_PATH=/opt/gigaam-venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/gigaam-venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/gigaam-venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/gigaam-venv/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/gigaam-venv/lib/python3.12/site-packages/nvidia/curand/lib:/opt/gigaam-venv/lib/python3.12/site-packages/nvidia/cusparse/lib:/opt/gigaam-venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:${LD_LIBRARY_PATH}
 RUN pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchaudio==2.10.0
 COPY requirements.txt /tmp/app-requirements.txt
 COPY benchmark/requirements.txt /tmp/benchmark-requirements.txt
 RUN sed '/^sherpa-onnx==/d; /^onnxruntime==/d' /tmp/app-requirements.txt > /tmp/gpu-requirements.txt \
  && pip install -r /tmp/gpu-requirements.txt -r /tmp/benchmark-requirements.txt
 ARG GIGAAM_REF=7447938d791c4f3e643386ee22c33777004293a5
-RUN pip install "gigaam @ git+https://github.com/salute-developers/GigaAM.git@${GIGAAM_REF}" \
+RUN pip install "gigaam @ https://github.com/salute-developers/GigaAM/archive/${GIGAAM_REF}.zip" \
  && pip uninstall -y onnxruntime \
  && pip install onnxruntime-gpu==1.24.4 \
  && pip install 'sherpa-onnx==1.13.4+cuda12.cudnn9' \

@@ -1,4 +1,4 @@
-"""Последовательный клиент рабочего Whisper: без повторов и управления сервером."""
+"""Последовательный клиент Whisper: один запрос, без повторов и редиректов."""
 from __future__ import annotations
 
 import ipaddress
@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 
 log = logging.getLogger("whisper-api")
+TEST_URL = "http://whisper-bench:9000/v1"
 
 
 def validate_url(value: str) -> str:
@@ -48,13 +49,18 @@ def speech_seconds(segments: list, duration: float) -> float:
 
 
 class WhisperAPI:
-    def __init__(self, base_url: str, key: str, model: str, timeout: float, transport=None):
-        self.base_url = validate_url(base_url)
-        if not key:
+    def __init__(self, base_url: str, key: str, model: str, timeout: float, transport=None, *, standalone=False):
+        if standalone:
+            if base_url != TEST_URL:
+                raise ValueError("Тестовый Whisper доступен только по внутреннему адресу whisper-bench:9000; подключение к проду запрещено")
+            self.base_url = TEST_URL
+        else:
+            self.base_url = validate_url(base_url)
+        if not key and not standalone:
             raise ValueError("Задайте WHISPER_API_KEY в .env на сервере; ключ не пишется в отчёт")
-        self.key, self.model = key, model
+        self.key, self.model, self.standalone = key, model, standalone
         self.client = httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {key}"},
+            headers={"Authorization": f"Bearer {key}"} if key else {},
             timeout=httpx.Timeout(timeout, connect=5.0, pool=5.0),
             limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
             transport=transport or httpx.AsyncHTTPTransport(retries=0),
@@ -71,8 +77,18 @@ class WhisperAPI:
         payload = models.json()
         if self.model not in [item.get("id") for item in payload.get("data", [])]:
             raise RuntimeError(f"Рабочий Whisper не объявляет модель {self.model}; менять/загружать её стенд не будет")
-        log.info("Whisper API: доступность и авторизация проверены, модель %s", self.model)
-        return {"health": health, "models": payload, "checked_at": time.time()}
+        result = {"health": health, "models": payload, "checked_at": time.time()}
+        if self.standalone:
+            response = await self.client.get(self.base_url.rsplit("/v1", 1)[0] + "/benchmark/metadata", timeout=10)
+            response.raise_for_status()
+            metadata = response.json()
+            if (metadata.get("stand") != "speech-comparison" or metadata.get("device") != "cuda"
+                    or metadata.get("compute_type") != "float16" or metadata.get("model") != self.model
+                    or metadata.get("model_loaded") is not True):
+                raise RuntimeError("Whisper не подтвердил тестовый стенд и CUDA/float16; записи не отправляются")
+            result["metadata"] = metadata
+        log.info("Whisper API: доступность проверена, модель %s, тестовый сервис %s", self.model, self.standalone)
+        return result
 
     async def health(self) -> dict:
         origin = self.base_url.rsplit("/v1", 1)[0]
@@ -88,7 +104,7 @@ class WhisperAPI:
         log.info("Whisper API: один POST, файл %s, байт %d, параметры %s; повторов нет", path.name, path.stat().st_size, parameters)
         started = time.perf_counter()
         result = {"status": "error", "text": "", "segments": [], "error": None,
-                  "mode": "existing_server_api", "endpoint": self.base_url + "/audio/transcriptions",
+                  "mode": "test_server_api" if self.standalone else "existing_server_api", "endpoint": self.base_url + "/audio/transcriptions",
                   "request_parameters": parameters, "attempts": 1,
                   "timer_boundary": "HTTP-запрос: передача WAV, очередь, обработка, получение ответа",
                   "server_may_still_be_processing": False}
@@ -107,7 +123,9 @@ class WhisperAPI:
             elapsed = time.perf_counter() - started
             result["response_bytes"] = len(body)
             # Даже ошибочный ответ не должен сохранить секрет, если сервер его отразил.
-            text = bytes(body).decode("utf-8", "replace").replace(self.key, "[КЛЮЧ СКРЫТ]")
+            text = bytes(body).decode("utf-8", "replace")
+            if self.key:
+                text = text.replace(self.key, "[КЛЮЧ СКРЫТ]")
             if response.status_code != 200:
                 result["response_error"] = text
                 raise RuntimeError(f"HTTP {response.status_code}; последующие запросы и GigaAM остановлены")
@@ -127,7 +145,9 @@ class WhisperAPI:
                           server_processing_seconds=None)
         except Exception as exc:
             result["elapsed_seconds"] = time.perf_counter() - started
-            result["error"] = f"{type(exc).__name__}: {exc}".replace(self.key, "[КЛЮЧ СКРЫТ]")
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            if self.key:
+                result["error"] = result["error"].replace(self.key, "[КЛЮЧ СКРЫТ]")
             result["server_may_still_be_processing"] = isinstance(exc, httpx.TransportError)
             log.error("Whisper API: %s. Автоматического повтора нет; после обрыва сервер может продолжать обработку", result["error"])
         return result

@@ -84,10 +84,24 @@ def prepare_audio(source: Path, target: Path, *, max_seconds: float | None = Non
     if max_seconds is not None:
         command.extend(["-t", str(max_seconds)])
     command.extend(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(target)])
-    completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    if completed.returncode:
-        detail = completed.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(f"Не удалось подготовить запись {source}: {detail}")
+    if shutil.which("ffmpeg"):
+        completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if completed.returncode:
+            detail = completed.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"Не удалось подготовить запись {source}: {detail}")
+    else:
+        # PyAV поставляется с faster-whisper в готовом CUDA-образе.
+        from faster_whisper.audio import decode_audio
+
+        log.info("Подготовка %s: PyAV из образа Whisper, моно PCM16 16 кГц; вне замеров", source)
+        samples = decode_audio(str(source), sampling_rate=16000)
+        if max_seconds is not None:
+            samples = samples[:int(max_seconds * 16000)]
+        with wave.open(str(target), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes((samples * 32768).clip(-32768, 32767).astype("<i2").tobytes())
     with wave.open(str(target), "rb") as wav:
         if (wav.getnchannels(), wav.getframerate(), wav.getsampwidth()) != (1, 16000, 2):
             raise ValueError("Подготовленный звук должен быть моно, 16 кГц, PCM 16 бит")
@@ -185,7 +199,8 @@ def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None
             writer.writeheader()
             writer.writerows(csv_rows)
     pairs = [row for row in rows if all(row.get(s, {}).get("status") == "ok" for s in ("whisper", "gigaam"))]
-    api_mode = mode == "api" or any(row.get("whisper", {}).get("mode") == "existing_server_api" for row in rows)
+    api_mode = mode in {"api", "standalone-api"} or any(row.get("whisper", {}).get("mode") in {"existing_server_api", "test_server_api"} for row in rows)
+    standalone = mode == "standalone-api" or any(row.get("whisper", {}).get("mode") == "test_server_api" for row in rows)
     lines = ["# Сравнение Whisper и полного цикла GigaAM", "", f"Состояние прогона: **{state}**.", "",
              "Одна NVIDIA GPU, один файл за раз. У GigaAM в полный цикл входят VAD, распознавание, голоса, эмоции и LLM.",
              "Общая подготовка, загрузка моделей, прогрев и запись отчётов исключены из замеров.",
@@ -226,6 +241,20 @@ def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None
                       "Встроенные параметры и провайдер VAD рабочего Whisper стенд не меняет и не определяет по /health.",
                       "Прогрев GigaAM исключён; дополнительного распознавания для прогрева рабочего Whisper нет.",
                       "Это сравнение рабочего сервиса с локальным полным конвейером. Посторонняя нагрузка и порядок фаз влияют на результат.", ""])
+    if standalone:
+        replacements = {
+            "Whisper — существующий сервис через API; модель и доступные сведения /health записаны в условия.json.":
+                "Whisper — собственная копия закреплённого образа рабочего сервиса; модель CUDA/float16 и фактические версии проверены через API.",
+            "Whisper: существующий сервис через API, его модель остаётся в GPU; затем весь корпус GigaAM в отдельных процессах.":
+                "Весь корпус Whisper после прогрева; затем тестовый Whisper остановлен, весь корпус GigaAM в отдельных процессах. Контейнеры сохраняются.",
+            "Встроенные параметры и провайдер VAD рабочего Whisper стенд не меняет и не определяет по /health.":
+                "Тестовый Whisper использует штатный VAD образа; распознавание — GPU, подготовка звука и часть вспомогательных операций — CPU.",
+            "Прогрев GigaAM исключён; дополнительного распознавания для прогрева рабочего Whisper нет.":
+                "Загрузка моделей и прогрев обеих систем исключены из измеряемых времён; GigaAM ASR измеряется отдельно от полного цикла.",
+            "Это сравнение рабочего сервиса с локальным полным конвейером. Посторонняя нагрузка и порядок фаз влияют на результат.":
+                "Продовые контейнеры и их API не используются. GPU общая: посторонняя нагрузка и порядок фаз влияют на результат.",
+        }
+        lines = [replacements.get(line, line) for line in lines]
     (output / "отчёт.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -270,7 +299,7 @@ def save_result(output: Path, row: dict, system: str, result: dict) -> None:
             log.info("Whisper — сегмент: %s", json.dumps(segment, ensure_ascii=False))
             if isinstance(segment, dict) and isinstance(segment.get("compression_ratio"), (int, float)) and segment["compression_ratio"] > 2.4:
                 log.warning("Whisper — высокая повторяемость текста: compression_ratio=%s; нужна проверка аудио", segment["compression_ratio"])
-        if result.get("mode") == "existing_server_api":
+        if result.get("mode") in {"existing_server_api", "test_server_api"}:
             log.info("Whisper API — HTTP %s, попыток %s, найденные сегменты %.3f с, ответ %s байт; чистое ASR-время сервер не сообщал",
                      result.get("http_status"), result.get("attempts"), result.get("speech_seconds", 0), result.get("response_bytes"))
 
@@ -466,8 +495,6 @@ def main(argv: list[str] | None = None) -> int:
         cli.error("Папка отчёта должна находиться вне папки исходных записей")
     if args.warmup_file and not args.warmup_file.is_file():
         cli.error("Файл --warmup-file не найден")
-    if not shutil.which("ffmpeg"):
-        cli.error("Для общей подготовки звука требуется ffmpeg")
     args.out.mkdir(parents=True)
     setup_logging(args.out)
     try:

@@ -1,11 +1,12 @@
-# Лёгкий клиент: не содержит моделей и не получает доступ к GPU.
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm
-FROM ${PYTHON_IMAGE}
-RUN apt-get -o APT::Update::Error-Mode=any update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+# Готовый образ рабочего Whisper; apt не используется.
+# Клиент получает PyAV из образа, но доступа к GPU у него нет.
+ARG WHISPER_IMAGE=hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6
+FROM ${WHISPER_IMAGE}
 RUN pip install --no-cache-dir httpx==0.28.1
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Europe/Moscow
+ENV TMPDIR=/tmp HOME=/tmp
 WORKDIR /srv
 COPY benchmark /srv/benchmark
+HEALTHCHECK NONE
 ENTRYPOINT ["python", "-m", "benchmark.compare"]
+CMD []

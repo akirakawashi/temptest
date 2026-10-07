@@ -41,7 +41,7 @@ def main() -> None:
     paths = source_files()
     manifest = {
         "format_version": 1,
-        "description": "Whisper ASR и полный цикл GigaAM: CUDA-стенд",
+        "description": "Отдельный Whisper large-v3 и полный цикл GigaAM: CUDA-стенд",
         "audio_included": False,
         "model_cache_included": False,
         "files": [{"path": str(path.relative_to(ROOT)), "size_bytes": path.stat().st_size,
