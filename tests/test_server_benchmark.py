@@ -172,8 +172,11 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
-@pytest.mark.parametrize("free, api_exit", [(14600, 0), (90000, 47), (90000, 0)])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, api_exit):
+@pytest.mark.parametrize("free, util, min_free, api_exit", [
+    (14600, 0, 16384, 0), (90000, 0, 16384, 47), (90000, 0, 16384, 0),
+    (14600, 100, 12288, 0),
+])
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, api_exit):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -188,20 +191,30 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
                       'sys.exit(int(os.environ["API_EXIT"]) if "whisper-api" in a else 0)\n')
     nvidia = bin_dir / "nvidia-smi"
     nvidia.write_text('#!/usr/bin/env python3\nimport os,sys\na=" ".join(sys.argv)\n'
-                      'print(os.environ["FREE_GPU"] if "--query-gpu=memory.free" in a else "0" if "--query-gpu=utilization.gpu" in a else "2026/10/07, uuid, 0, 1000, 90000, 95830, 80, 32")\n')
+                      'print(os.environ["FREE_GPU"] if "--query-gpu=memory.free" in a else os.environ["GPU_UTIL"] if "--query-gpu=utilization.gpu" in a else "2026/10/07, uuid, 0, 1000, 90000, 95830, 80, 32")\n')
     docker.chmod(0o755)
     nvidia.chmod(0o755)
     env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
-           "FREE_GPU": str(free), "API_EXIT": str(api_exit), "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
+           "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
+           "API_EXIT": str(api_exit), "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
                             capture_output=True, text=True, timeout=15)
-    assert result.returncode == (42 if free < 16384 else api_exit)
+    precheck_failed = free < min_free or util > 10
+    assert result.returncode == (42 if precheck_failed else api_exit)
     commands = command_log.read_text()
     assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands
-    if free < 16384 or api_exit:
+    if precheck_failed or api_exit:
         assert "'build', 'compare'" not in commands and "'up', '-d', 'ollama'" not in commands
     else:
         assert commands.index("whisper-api") < commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
         assert "'stop', 'ollama'" in commands and "'stop', 'ollama-download'" in commands
-    if free < 16384:
+    if precheck_failed:
         assert "whisper-api" not in commands
+        assert "file changed as we read it" not in result.stdout + result.stderr
+        archives = list((folder / "benchmark-results").glob("*/диагностика.tar.gz"))
+        assert len(archives) == 1
+        with tarfile.open(archives[0]) as archive:
+            assert "./логи/запуск.log" in archive.getnames()
+            assert all(not name.endswith(".tar.gz") for name in archive.getnames())
+            assert "Стенд не запускается" in archive.extractfile("./логи/запуск.log").read().decode()
+        assert not list((folder / "benchmark-results").glob("*.tar.part"))

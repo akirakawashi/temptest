@@ -46,6 +46,18 @@ bench_compose() {
     docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
         -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" "$@"
 }
+archive_logs_on_host() {
+    local temporary_archive
+    # Запись внутри исходной папки меняет её во время чтения tar.
+    temporary_archive=$(mktemp "$BENCH_OUT/.диагностика-$BENCH_RUN_ID-XXXXXX.tar.part") || return 1
+    if tar --exclude='./диагностика.tar.gz' --exclude='./диагностика.tar.part' --exclude='./временные' \
+        -czf "$temporary_archive" -C "$BENCH_RUN_OUT" . && \
+        mv -f -- "$temporary_archive" "$BENCH_RUN_OUT/диагностика.tar.gz"; then
+        return 0
+    fi
+    rm -f -- "$temporary_archive"
+    return 1
+}
 cleanup() {
     local bench_exit_code=$?
     trap - EXIT
@@ -70,12 +82,11 @@ cleanup() {
         if ! bench_compose run --rm --no-deps --entrypoint python whisper-client -m benchmark.artifacts \
             "/results/$BENCH_RUN_ID" --exit-code "$bench_exit_code"; then
             echo 'Не удалось завершить отчёт контейнером; сохраняем архив журналов на хосте'
-            tar --exclude='./диагностика.tar.gz' --exclude='./диагностика.tar.part' --exclude='./временные' \
-                -czf "$BENCH_RUN_OUT/диагностика.tar.gz" -C "$BENCH_RUN_OUT" . || true
+            archive_logs_on_host || true
             (( bench_exit_code != 0 )) || bench_exit_code=1
         fi
     else
-        tar --exclude='./диагностика.tar.gz' --exclude='./временные' -czf "$BENCH_RUN_OUT/диагностика.tar.gz" -C "$BENCH_RUN_OUT" . || true
+        archive_logs_on_host || true
     fi
     rm -rf -- "$BENCH_RUN_OUT/временные"
     return "$bench_exit_code"
