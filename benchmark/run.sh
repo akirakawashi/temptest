@@ -47,7 +47,7 @@ BENCH_RUN_OUT="$BENCH_OUT/$BENCH_RUN_ID"
 BENCH_GIGA_CONTAINER="speech-comparison-gigaam-$BENCH_RUN_ID"
 BENCH_PREFETCH_CONTAINER="speech-comparison-prefetch-$BENCH_RUN_ID"
 mkdir -p "$BENCH_RUN_OUT/логи"
-exec > >(tee -a "$BENCH_RUN_OUT/логи/запуск.log") 2>&1
+exec > >(tee -i -a "$BENCH_RUN_OUT/логи/запуск.log") 2>&1
 BENCH_CLIENT_READY=0
 BENCH_OLLAMA_STARTED=0
 BENCH_DOWNLOAD_STARTED=0
@@ -153,6 +153,8 @@ if ! check_capacity; then
     echo "Стенд не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ, диск ≥ $BENCH_MIN_DISK МиБ. Запросов Whisper не было."
     exit 42
 fi
+docker compose version
+docker buildx version
 bench_compose build whisper-client
 BENCH_CLIENT_READY=1
 echo 'Whisper API' > "$BENCH_RUN_OUT/логи/этап.txt"
