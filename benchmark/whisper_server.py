@@ -32,7 +32,13 @@ def main():
     if args.download:
         from faster_whisper.utils import download_model
 
-        download_model(model, cache_dir=cache)
+        log.info("Скачивание весов с Hugging Face; CUDA и API не запускаются")
+        try:
+            download_model(model, cache_dir=cache)
+        except Exception:
+            log.exception("Не удалось подготовить веса Whisper. Если ниже Network is unreachable, "
+                          "загрузчик не смог подключиться к Hugging Face; распознавание ещё не началось")
+            raise
         log.info("Веса Whisper подготовлены; GPU и папка записей не подключены")
         return
 

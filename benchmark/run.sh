@@ -19,6 +19,17 @@ case "$BENCH_BUILD_NETWORK" in
     default|host) ;;
     *) echo 'BENCH_BUILD_NETWORK должен быть default или host' >&2; exit 2 ;;
 esac
+export BENCH_DOWNLOAD_NETWORK="${BENCH_DOWNLOAD_NETWORK:-host}"
+case "$BENCH_DOWNLOAD_NETWORK" in
+    host|bridge) ;;
+    *) echo 'BENCH_DOWNLOAD_NETWORK должен быть host или bridge' >&2; exit 2 ;;
+esac
+export BENCH_OLLAMA_DOWNLOAD_PORT="${BENCH_OLLAMA_DOWNLOAD_PORT:-11435}"
+[[ "$BENCH_OLLAMA_DOWNLOAD_PORT" =~ ^[0-9]{1,5}$ ]] && \
+    (( 10#$BENCH_OLLAMA_DOWNLOAD_PORT >= 1024 && 10#$BENCH_OLLAMA_DOWNLOAD_PORT <= 65535 )) || {
+    echo 'BENCH_OLLAMA_DOWNLOAD_PORT должен быть целым числом от 1024 до 65535' >&2; exit 2;
+}
+export BENCH_OLLAMA_DOWNLOAD_PORT=$((10#$BENCH_OLLAMA_DOWNLOAD_PORT))
 export BENCH_CPUSET="${BENCH_CPUSET:-0-3}"
 export BENCH_UID="$(id -u)"
 export BENCH_GID="$(id -g)"
@@ -111,6 +122,7 @@ cleanup() {
         # Отчёт не требует сети/GPU; его завершённый контейнер также сохраняется.
         if ! docker run --name "$BENCH_ARTIFACTS_CONTAINER" --network none \
             --memory 2g --cpus 1 --user "$BENCH_UID:$BENCH_GID" --env TZ=Europe/Moscow \
+            --env NVIDIA_VISIBLE_DEVICES=void \
             --volume "$BENCH_OUT:/results" --entrypoint python \
             speech-comparison:4.0.0-whisper-standalone -m benchmark.artifacts \
             "/results/$BENCH_RUN_ID" --exit-code "$bench_exit_code"; then
@@ -177,6 +189,8 @@ check_capacity() {
 echo "Прогон $BENCH_RUN_ID: собственный Whisper → остановка Whisper → полный GigaAM; GPU $BENCH_GPU."
 echo 'Адрес Whisper: только whisper-bench:9000 внутри стенда. API и ключи прода не используются.'
 echo "Сеть сборки образов: $BENCH_BUILD_NETWORK."
+echo "Сеть загрузки весов: $BENCH_DOWNLOAD_NETWORK; загрузчики без GPU и аудиозаписей."
+echo "Ollama для загрузки: только 127.0.0.1:$BENCH_OLLAMA_DOWNLOAD_PORT; обработка аудио — во внутренних сетях."
 echo 'Сборка образов: Docker Compose, подробный вывод.'
 echo "Допустимая загрузка GPU при проверке ресурсов: $BENCH_GPU_MAX_UTIL%."
 if (( BENCH_GPU_MAX_UTIL > 10 )); then
@@ -195,7 +209,8 @@ gpu_monitor &
 BENCH_MONITOR_PID=$!
 timeout 3600 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
     -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --no-deps \
-    --name "$BENCH_WHISPER_DOWNLOAD_CONTAINER" whisper-download
+    --name "$BENCH_WHISPER_DOWNLOAD_CONTAINER" whisper-download \
+    2>&1 | tee -i "$BENCH_RUN_OUT/логи/загрузка-whisper.log"
 if ! check_capacity; then
     echo 'Ресурсы изменились за время подготовки; тестовый Whisper не запускается'
     exit 42
@@ -216,12 +231,14 @@ fi
 echo 'Загрузка моделей' > "$BENCH_RUN_OUT/логи/этап.txt"
 bench_compose --progress plain build compare
 timeout 3600 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
-    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --no-deps --name "$BENCH_PREFETCH_CONTAINER" prefetch
+    -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" run --no-deps --name "$BENCH_PREFETCH_CONTAINER" prefetch \
+    2>&1 | tee -i "$BENCH_RUN_OUT/логи/загрузка-gigaam.log"
 BENCH_DOWNLOAD_STARTED=1
-bench_compose up -d ollama-download
+bench_compose up -d --wait --wait-timeout 60 ollama-download
 timeout 7200 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
     -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" exec -T ollama-download sh -c \
-    'for i in $(seq 1 60); do if ollama list >/dev/null 2>&1; then exec ollama pull "$LLM_MODEL"; fi; sleep 1; done; exit 1'
+    'exec ollama pull "$LLM_MODEL"' \
+    2>&1 | tee -i "$BENCH_RUN_OUT/логи/загрузка-llm.log"
 bench_compose stop ollama-download
 if ! check_capacity; then
     echo 'Нагрузка изменилась за время подготовки; GigaAM не запускается'

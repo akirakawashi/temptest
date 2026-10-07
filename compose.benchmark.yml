@@ -17,6 +17,7 @@ services:
     cpuset: "${BENCH_CPUSET:-0-3}"
     mem_limit: 2g
     environment:
+      NVIDIA_VISIBLE_DEVICES: void
       BENCH_THREADS: ${BENCH_THREADS:-4}
       BENCH_GPU: ${BENCH_GPU:-0}
       BENCH_GPU_MIN_FREE_MIB: ${BENCH_GPU_MIN_FREE_MIB:-16384}
@@ -96,7 +97,10 @@ services:
     user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
     cpus: "${BENCH_THREADS:-4}"
     mem_limit: 2g
+    # Только скачивание публичных весов: ни GPU, ни записей, ни сервера API.
+    network_mode: ${BENCH_DOWNLOAD_NETWORK:-host}
     environment:
+      NVIDIA_VISIBLE_DEVICES: void
       WHISPER_MODEL: ${BENCH_WHISPER_MODEL:-large-v3}
       HF_HUB_DISABLE_TELEMETRY: "1"
       TZ: Europe/Moscow
@@ -185,8 +189,10 @@ services:
     cpus: "${BENCH_THREADS:-4}"
     cpuset: "${BENCH_CPUSET:-0-3}"
     mem_limit: 8g
+    network_mode: ${BENCH_DOWNLOAD_NETWORK:-host}
     entrypoint: ["python", "-m", "benchmark.prefetch"]
     environment:
+      NVIDIA_VISIBLE_DEVICES: void
       EMO_CACHE: /cache/gigaam
       HF_HUB_DISABLE_TELEMETRY: "1"
     volumes:
@@ -195,9 +201,18 @@ services:
   ollama-download:
     image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
     mem_limit: 2g
+    network_mode: ${BENCH_DOWNLOAD_NETWORK:-host}
     environment:
+      NVIDIA_VISIBLE_DEVICES: void
+      # При host-сети API подготовки слушает только loopback и другой порт.
+      OLLAMA_HOST: "127.0.0.1:${BENCH_OLLAMA_DOWNLOAD_PORT:-11435}"
       OLLAMA_NO_CLOUD: "1"
       LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
     volumes:
       - comparison-ollama:/root/.ollama
 

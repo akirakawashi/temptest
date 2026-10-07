@@ -5,6 +5,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -182,13 +183,15 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
-@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit", [
-    (14600, 0, 16384, 10, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0), (90000, 0, 16384, 10, 0, 0, 0, 0),
-    (14600, 100, 12288, 10, 0, 0, 0, 0), (14600, 100, 12288, 100, 0, 0, 0, 0),
-    (3000, 100, 12288, 100, 0, 0, 0, 0), (14600, 100, 12288, 100, 0, 23, 0, 0),
-    (14600, 100, 12288, 100, 0, 0, 31, 0), (14600, 100, 12288, 100, 0, 0, 0, 32),
+@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit", [
+    (14600, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0, 0, 0),
+    (90000, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (14600, 100, 12288, 10, 0, 0, 0, 0, 0, 0),
+    (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0), (3000, 100, 12288, 100, 0, 0, 0, 0, 0, 0),
+    (14600, 100, 12288, 100, 0, 23, 0, 0, 0, 0), (14600, 100, 12288, 100, 0, 0, 31, 0, 0, 0),
+    (14600, 100, 12288, 100, 0, 0, 0, 32, 0, 0), (14600, 100, 12288, 100, 0, 0, 0, 0, 51, 0),
+    (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 52),
 ])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit):
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -202,6 +205,8 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
                       'if a[0] == "compose" and "build" in a and a[-1] == "whisper-client": sys.exit(int(os.environ["CLIENT_BUILD_EXIT"]))\n'
                       'if a[0] == "compose" and "up" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_START_EXIT"]))\n'
                       'if a[0] == "compose" and "stop" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_STOP_EXIT"]))\n'
+                      'if a[0] == "compose" and "run" in a and a[-1] == "whisper-download": sys.exit(int(os.environ["WHISPER_DOWNLOAD_EXIT"]))\n'
+                      'if a[0] == "compose" and "up" in a and a[-1] == "ollama-download": sys.exit(int(os.environ["OLLAMA_DOWNLOAD_START_EXIT"]))\n'
                       'if "info" in a: print("/tmp")\n'
                       'sys.exit(int(os.environ["API_EXIT"]) if "whisper-api" in a else 0)\n')
     nvidia = bin_dir / "nvidia-smi"
@@ -213,13 +218,15 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
            "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
            "BENCH_GPU_MAX_UTIL": str(max_util),
            "BENCH_BUILD_NETWORK": "default",
+           "BENCH_DOWNLOAD_NETWORK": "host", "BENCH_OLLAMA_DOWNLOAD_PORT": "11435",
            "API_EXIT": str(api_exit), "CLIENT_BUILD_EXIT": str(client_build_exit),
            "WHISPER_START_EXIT": str(whisper_start_exit), "WHISPER_STOP_EXIT": str(whisper_stop_exit),
+           "WHISPER_DOWNLOAD_EXIT": str(whisper_download_exit), "OLLAMA_DOWNLOAD_START_EXIT": str(ollama_download_start_exit),
            "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
                             capture_output=True, text=True, timeout=15)
     precheck_failed = free < min_free or util > max_util
-    assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)))
+    assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)) or ollama_download_start_exit)
     commands = command_log.read_text()
     builds = [command for line in commands.splitlines()
               if (command := ast.literal_eval(line))[0] == "compose" and "build" in command]
@@ -231,13 +238,26 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         assert build[-1] in {"whisper-client", "compare"}
     assert "'buildx', 'build'" not in commands
     assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands
-    if precheck_failed or client_build_exit or whisper_start_exit or api_exit or whisper_stop_exit:
+    if precheck_failed or client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or whisper_stop_exit:
         assert "'build', 'compare'" not in commands and "'up', '-d', 'ollama'" not in commands
         assert len(builds) == (0 if precheck_failed else 1)
     else:
         assert len(builds) == 2
-        assert commands.index("whisper-api") < commands.index("'stop', 'whisper-bench'") < commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
-        assert "'stop', 'ollama'" in commands and "'stop', 'ollama-download'" in commands
+        assert commands.index("whisper-api") < commands.index("'stop', 'whisper-bench'") < commands.index("'build', 'compare'")
+        download_up = next(ast.literal_eval(line) for line in commands.splitlines()
+                           if "'up'" in line and "'ollama-download'" in line)
+        assert "--wait" in download_up and "--wait-timeout" in download_up
+        assert "'stop', 'ollama-download'" in commands
+        if ollama_download_start_exit:
+            assert "'exec', '-T', 'ollama-download'" not in commands
+            assert "'up', '-d', 'ollama'" not in commands
+        else:
+            assert commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
+            assert "'stop', 'ollama'" in commands
+    if whisper_download_exit:
+        assert "whisper-api" not in commands and "'up', '-d', '--wait', '--wait-timeout', '600', 'whisper-bench'" not in commands
+        download_logs = list((folder / "benchmark-results").glob("*/логи/загрузка-whisper.log"))
+        assert len(download_logs) == 1
     if precheck_failed or client_build_exit:
         assert "whisper-api" not in commands
         assert "file changed as we read it" not in result.stdout + result.stderr
@@ -254,6 +274,40 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         assert "--rm" not in command and "--remove-orphans" not in command
         assert "rm" not in command and "down" not in command
     assert "10.220.21.2" not in commands and "WHISPER_API_KEY" not in commands
+
+
+@pytest.mark.parametrize("download_network", ["host", "bridge"])
+def test_download_network_never_reaches_audio_processing_containers(tmp_path, download_network):
+    """Только разбор Compose: без демона Docker, контейнеров и скачивания моделей."""
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("Для разбора Compose нужен CLI Docker")
+    project = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "BENCH_AUDIO_DIR": str(tmp_path / "audio"), "BENCH_OUT": str(tmp_path / "results"),
+           "BENCH_CACHE": str(tmp_path / "cache"), "BENCH_DOWNLOAD_NETWORK": download_network,
+           "BENCH_BUILD_NETWORK": "default", "BENCH_OLLAMA_DOWNLOAD_PORT": "11435",
+           "HF_TOKEN": "", "WHISPER_API_BASE_URL": "http://production.example/v1", "WHISPER_API_KEY": "prod-secret"}
+    parsed = subprocess.run([docker, "compose", "--env-file", "/dev/null", "--project-name", "speech-comparison",
+                             "--project-directory", str(project), "-f", str(project / "compose.benchmark.yml"),
+                             "config", "--format", "json"], env=env, capture_output=True, text=True, timeout=15)
+    assert parsed.returncode == 0, parsed.stderr
+    config = json.loads(parsed.stdout)
+    services = config["services"]
+    for name in ("whisper-download", "prefetch", "ollama-download"):
+        service = services[name]
+        assert service["network_mode"] == download_network and not service.get("networks")
+        assert not service.get("ports") and not service.get("gpus") and not service.get("deploy")
+        assert service["environment"]["NVIDIA_VISIBLE_DEVICES"] == "void"
+        assert all(mount["target"] != "/recordings" for mount in service.get("volumes", []))
+    for name, network in (("whisper-client", "whisper"), ("whisper-bench", "whisper"), ("compare", "gigaam"), ("ollama", "gigaam")):
+        service = services[name]
+        assert not service.get("network_mode") and set(service["networks"]) == {network}
+        assert config["networks"][network]["internal"] is True
+        assert not service.get("ports")
+    client = services["whisper-client"]["environment"]
+    assert client["WHISPER_API_BASE_URL"] == TEST_URL and "WHISPER_API_KEY" not in client
+    assert services["ollama-download"]["environment"]["OLLAMA_HOST"] == "127.0.0.1:11435"
+    assert services["ollama-download"]["healthcheck"]["test"] == ["CMD", "ollama", "list"]
 
 
 @pytest.mark.parametrize("url", ["http://10.220.21.2:8002/v1", "http://localhost:9000/v1", "https://api.openai.com/v1"])
