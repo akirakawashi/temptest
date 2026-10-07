@@ -1,4 +1,5 @@
 """Без запросов на рабочий сервер, Docker, скачиваний и GPU inference."""
+import ast
 import asyncio
 from dataclasses import asdict
 import json
@@ -172,12 +173,12 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
-@pytest.mark.parametrize("free, util, min_free, max_util, api_exit", [
-    (14600, 0, 16384, 10, 0), (90000, 0, 16384, 10, 47), (90000, 0, 16384, 10, 0),
-    (14600, 100, 12288, 10, 0), (14600, 100, 12288, 100, 0),
-    (3000, 100, 12288, 100, 0),
+@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit", [
+    (14600, 0, 16384, 10, 0, 0), (90000, 0, 16384, 10, 47, 0), (90000, 0, 16384, 10, 0, 0),
+    (14600, 100, 12288, 10, 0, 0), (14600, 100, 12288, 100, 0, 0),
+    (3000, 100, 12288, 100, 0, 0), (14600, 100, 12288, 100, 0, 23),
 ])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit):
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -188,6 +189,7 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     command_log = tmp_path / "commands.log"
     docker = bin_dir / "docker"
     docker.write_text('#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\nwith open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
+                      'if a[:2] == ["buildx","build"] and "speech-comparison:3.0.0-api-client" in a: sys.exit(int(os.environ["CLIENT_BUILD_EXIT"]))\n'
                       'if "info" in a: print("/tmp")\n'
                       'sys.exit(int(os.environ["API_EXIT"]) if "whisper-api" in a else 0)\n')
     nvidia = bin_dir / "nvidia-smi"
@@ -198,19 +200,29 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
            "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
            "BENCH_GPU_MAX_UTIL": str(max_util),
-           "API_EXIT": str(api_exit), "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
+           "BENCH_BUILD_NETWORK": "host",
+           "API_EXIT": str(api_exit), "CLIENT_BUILD_EXIT": str(client_build_exit),
+           "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     result = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
                             capture_output=True, text=True, timeout=15)
     precheck_failed = free < min_free or util > max_util
-    assert result.returncode == (42 if precheck_failed else api_exit)
+    assert result.returncode == (42 if precheck_failed else client_build_exit or api_exit)
     commands = command_log.read_text()
+    builds = [ast.literal_eval(line) for line in commands.splitlines() if "'buildx', 'build'" in line]
+    for build in builds:
+        assert "--builder=default" in build and "--network=host" in build
+        assert "--allow=network.host" in build and "--progress=plain" in build and "--load" in build
+        assert build[-1] == str(folder)
+    assert "'compose', 'build'" not in commands
     assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands
-    if precheck_failed or api_exit:
-        assert "'build', 'compare'" not in commands and "'up', '-d', 'ollama'" not in commands
+    if precheck_failed or client_build_exit or api_exit:
+        assert "speech-comparison:2.0.0-cuda" not in commands and "'up', '-d', 'ollama'" not in commands
+        assert len(builds) == (0 if precheck_failed else 1)
     else:
-        assert commands.index("whisper-api") < commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
+        assert len(builds) == 2
+        assert commands.index("whisper-api") < commands.index("speech-comparison:2.0.0-cuda") < commands.index("'up', '-d', 'ollama'")
         assert "'stop', 'ollama'" in commands and "'stop', 'ollama-download'" in commands
-    if precheck_failed:
+    if precheck_failed or client_build_exit:
         assert "whisper-api" not in commands
         assert "file changed as we read it" not in result.stdout + result.stderr
         archives = list((folder / "benchmark-results").glob("*/диагностика.tar.gz"))
@@ -218,5 +230,6 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         with tarfile.open(archives[0]) as archive:
             assert "./логи/запуск.log" in archive.getnames()
             assert all(not name.endswith(".tar.gz") for name in archive.getnames())
-            assert "Стенд не запускается" in archive.extractfile("./логи/запуск.log").read().decode()
+            log_text = archive.extractfile("./логи/запуск.log").read().decode()
+            assert ("Стенд не запускается" if precheck_failed else f"Завершение: код {client_build_exit}") in log_text
         assert not list((folder / "benchmark-results").glob("*.tar.part"))

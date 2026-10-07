@@ -1,7 +1,7 @@
 # Отдельный NVIDIA CUDA стенд; CPU-образ монитора не нужен.
-ARG PYTHON_IMAGE=python:3.13-slim
+ARG PYTHON_IMAGE=python:3.13-slim-bookworm
 FROM ${PYTHON_IMAGE} AS models
-RUN apt-get update \
+RUN apt-get -o APT::Update::Error-Mode=any update \
  && apt-get install -y --no-install-recommends curl bzip2 ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY scripts/download_models.sh /tmp/download_models.sh
@@ -9,7 +9,7 @@ COPY scripts/download_models.sh /tmp/download_models.sh
 RUN DOWNLOAD_ASR=0 sh /tmp/download_models.sh /models
 
 FROM ${PYTHON_IMAGE} AS runtime
-RUN apt-get update \
+RUN apt-get -o APT::Update::Error-Mode=any update \
  && apt-get install -y --no-install-recommends git ca-certificates ffmpeg libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 RUN python -m venv /opt/venv
