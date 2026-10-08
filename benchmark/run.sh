@@ -10,6 +10,16 @@ fi
 BENCH_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 export BENCH_AUDIO_DIR="$(cd -- "$1" && pwd -P)"
 shift
+BENCH_GIGAAM_ONLY=0
+BENCH_FORWARDED_ARGS=()
+for bench_arg in "$@"; do
+    if [[ "$bench_arg" == '--gigaam-only' ]]; then
+        BENCH_GIGAAM_ONLY=1
+    else
+        BENCH_FORWARDED_ARGS+=("$bench_arg")
+    fi
+done
+set -- "${BENCH_FORWARDED_ARGS[@]}"
 exec 9>"$BENCH_PROJECT_DIR/.benchmark.lock"
 flock -n 9 || { echo 'Другой прогон этого стенда уже выполняется' >&2; exit 2; }
 export BENCH_OUT="${BENCH_OUT:-$BENCH_PROJECT_DIR/benchmark-results}"
@@ -59,10 +69,13 @@ case "$BENCH_CACHE/" in "$BENCH_AUDIO_DIR/"*) echo 'Кеш должен быть
 BENCH_RUN_OUT="$BENCH_OUT/$BENCH_RUN_ID"
 BENCH_GIGA_CONTAINER="speech-comparison-gigaam-$BENCH_RUN_ID"
 BENCH_PREFETCH_CONTAINER="speech-comparison-prefetch-$BENCH_RUN_ID"
+BENCH_PREPARE_CONTAINER="speech-comparison-audio-prepare-$BENCH_RUN_ID"
 BENCH_CLIENT_CONTAINER="speech-comparison-client-$BENCH_RUN_ID"
 BENCH_WHISPER_DOWNLOAD_CONTAINER="speech-comparison-whisper-download-$BENCH_RUN_ID"
 BENCH_ARTIFACTS_CONTAINER="speech-comparison-artifacts-$BENCH_RUN_ID"
-mkdir -p "$BENCH_CACHE/whisper"
+if (( ! BENCH_GIGAAM_ONLY )); then
+    mkdir -p "$BENCH_CACHE/whisper"
+fi
 mkdir -p "$BENCH_RUN_OUT/логи"
 # Запись журнала не должна ждать вывода в SSH/VS Code.
 # Основной процесс пишет прямо в файл; отдельный читатель показывает его в терминале.
@@ -73,6 +86,8 @@ timeout --foreground --kill-after=3 0 tail --follow=descriptor --sleep-interval=
 BENCH_CONSOLE_PID=$!
 exec 8>&-
 BENCH_CLIENT_READY=0
+BENCH_ARTIFACTS_IMAGE=speech-comparison:4.0.0-whisper-standalone
+BENCH_COMPLETED=0
 BENCH_WHISPER_STARTED=0
 BENCH_OLLAMA_STARTED=0
 BENCH_DOWNLOAD_STARTED=0
@@ -165,6 +180,10 @@ archive_logs_on_host() {
 cleanup() {
     local bench_exit_code=$?
     trap - EXIT
+    if (( bench_exit_code == 0 && ! BENCH_COMPLETED )); then
+        bench_exit_code=1
+        echo 'Прогон прерван до завершения всех этапов; код 0 заменён на 1.'
+    fi
     stop_task_log
     if [[ -n "$BENCH_MONITOR_PID" ]]; then
         kill "$BENCH_MONITOR_PID" 2>/dev/null || true
@@ -172,8 +191,13 @@ cleanup() {
     fi
     docker stop --time 10 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
     docker stop --time 10 "$BENCH_PREFETCH_CONTAINER" >/dev/null 2>&1 || true
-    docker stop --time 10 "$BENCH_CLIENT_CONTAINER" >/dev/null 2>&1 || true
-    docker stop --time 10 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" >/dev/null 2>&1 || true
+    if (( BENCH_GIGAAM_ONLY )); then
+        docker stop --time 10 "$BENCH_PREPARE_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if (( ! BENCH_GIGAAM_ONLY )); then
+        docker stop --time 10 "$BENCH_CLIENT_CONTAINER" >/dev/null 2>&1 || true
+        docker stop --time 10 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" >/dev/null 2>&1 || true
+    fi
     save_task_log || true
     stop_test_whisper || true
     if (( BENCH_OLLAMA_STARTED )); then
@@ -193,7 +217,7 @@ cleanup() {
             --memory 2g --cpus 1 --user "$BENCH_UID:$BENCH_GID" --env TZ=Europe/Moscow \
             --env NVIDIA_VISIBLE_DEVICES=void \
             --volume "$BENCH_OUT:/results" --entrypoint python \
-            speech-comparison:4.0.0-whisper-standalone -m benchmark.artifacts \
+            "$BENCH_ARTIFACTS_IMAGE" -m benchmark.artifacts \
             "/results/$BENCH_RUN_ID" --exit-code "$bench_exit_code"; then
             echo 'Не удалось завершить отчёт контейнером; сохраняем архив журналов на хосте'
             archive_logs_on_host || true
@@ -212,6 +236,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'echo "Получен SIGHUP: сессия закрыта, прогон прерывается."; exit 129' HUP
 gpu_monitor() {
     echo 'timestamp, uuid, utilization_percent, used_mib, free_mib, total_mib, power_w, temperature_c, phase' > "$BENCH_RUN_OUT/логи/gpu.csv"
     while true; do
@@ -259,8 +284,13 @@ check_capacity() {
         [[ "$free_disk" =~ ^[0-9]+$ ]] && (( free_disk >= BENCH_MIN_DISK )) || return 1
     done
 }
-echo "Прогон $BENCH_RUN_ID: собственный Whisper → остановка Whisper → полный GigaAM; GPU $BENCH_GPU."
-echo 'Адрес Whisper: только whisper-bench:9000 внутри стенда. API и ключи прода не используются.'
+if (( BENCH_GIGAAM_ONLY )); then
+    echo "Прогон $BENCH_RUN_ID: только полный цикл GigaAM; GPU $BENCH_GPU."
+    echo 'Whisper не запускается; его предыдущие результаты остаются в прежней папке.'
+else
+    echo "Прогон $BENCH_RUN_ID: собственный Whisper → остановка Whisper → полный GigaAM; GPU $BENCH_GPU."
+    echo 'Адрес Whisper: только whisper-bench:9000 внутри стенда. API и ключи прода не используются.'
+fi
 echo "Сеть сборки образов: $BENCH_BUILD_NETWORK."
 echo "Сеть загрузки весов: $BENCH_DOWNLOAD_NETWORK; загрузчики без GPU и аудиозаписей."
 echo "Ollama для загрузки: только 127.0.0.1:$BENCH_OLLAMA_DOWNLOAD_PORT; обработка аудио — во внутренних сетях."
@@ -270,14 +300,24 @@ if (( BENCH_GPU_MAX_UTIL > 10 )); then
     echo 'Допускается рабочая нагрузка на общей GPU. Времена зависят от других сервисов; проверки памяти сохраняются.'
 fi
 if ! check_capacity; then
-    echo "Стенд не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ, диск ≥ $BENCH_MIN_DISK МиБ. Запросов Whisper не было."
+    echo "Стенд не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ, диск ≥ $BENCH_MIN_DISK МиБ. Обработка аудио не начиналась."
     exit 42
 fi
 docker compose version
 docker buildx version
+if (( BENCH_GIGAAM_ONLY )); then
+    bench_running_whisper=$(bench_compose ps --status running --quiet whisper-bench)
+    if [[ -n "$bench_running_whisper" ]]; then
+        echo 'Тестовый Whisper ещё работает. Сначала проверьте и остановите его контейнер в проекте speech-comparison; GigaAM не запускается.'
+        exit 42
+    fi
+    echo 'Подготовка GigaAM' > "$BENCH_RUN_OUT/логи/этап.txt"
+else
+    echo 'Подготовка Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
+fi
+# В режиме GigaAM образ нужен только для общего декодера и отчёта, без Whisper ASR.
 bench_compose --progress plain build whisper-client
 BENCH_CLIENT_READY=1
-echo 'Подготовка Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
 (
     # Завершение монитора не должно вызывать cleanup всего прогона второй раз.
     trap - EXIT
@@ -285,24 +325,29 @@ echo 'Подготовка Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
     gpu_monitor
 ) &
 BENCH_MONITOR_PID=$!
-run_task 3600 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" загрузка-whisper.log whisper-download
-echo 'Загрузка Whisper завершена; проверяем ресурсы перед запуском GPU-сервера.'
-if ! check_capacity; then
-    echo 'Ресурсы изменились за время подготовки; тестовый Whisper не запускается'
-    exit 42
+if (( BENCH_GIGAAM_ONLY )); then
+    run_task 0 "$BENCH_PREPARE_CONTAINER" подготовка-аудио.log audio-prepare "$@" \
+        --phase gigaam-prepare --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+else
+    run_task 3600 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" загрузка-whisper.log whisper-download
+    echo 'Загрузка Whisper завершена; проверяем ресурсы перед запуском GPU-сервера.'
+    if ! check_capacity; then
+        echo 'Ресурсы изменились за время подготовки; тестовый Whisper не запускается'
+        exit 42
+    fi
+    echo 'Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
+    BENCH_WHISPER_STARTED=1
+    echo 'Запускаем тестовый Whisper на GPU; ожидание готовности до 600 секунд.'
+    bench_compose up -d --wait --wait-timeout 600 whisper-bench
+    [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
+    run_task 0 "$BENCH_CLIENT_CONTAINER" whisper-клиент.log whisper-client "$@" \
+        --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+    stop_test_whisper
+    echo 'Whisper завершён' > "$BENCH_RUN_OUT/логи/этап.txt"
 fi
-echo 'Whisper' > "$BENCH_RUN_OUT/логи/этап.txt"
-BENCH_WHISPER_STARTED=1
-echo 'Запускаем тестовый Whisper на GPU; ожидание готовности до 600 секунд.'
-bench_compose up -d --wait --wait-timeout 600 whisper-bench
-[[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
-run_task 0 "$BENCH_CLIENT_CONTAINER" whisper-клиент.log whisper-client "$@" \
-    --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
-stop_test_whisper
-echo 'Whisper завершён' > "$BENCH_RUN_OUT/логи/этап.txt"
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
 if ! check_capacity; then
-    echo "GigaAM не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ. Результаты Whisper сохранены."
+    echo "GigaAM не запускается: нужно GPU ≥ $BENCH_MIN_FREE МиБ, загрузка ≤ $BENCH_GPU_MAX_UTIL%, RAM ≥ $BENCH_MIN_RAM МиБ. Уже сохранённые результаты остаются в папках прогонов."
     exit 42
 fi
 echo 'Загрузка моделей' > "$BENCH_RUN_OUT/логи/этап.txt"
@@ -323,6 +368,11 @@ echo 'GigaAM' > "$BENCH_RUN_OUT/логи/этап.txt"
 BENCH_OLLAMA_STARTED=1
 bench_compose up -d ollama
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
-run_task 0 "$BENCH_GIGA_CONTAINER" gigaam-контейнер.log compare "$@" --phase gigaam --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+BENCH_GIGAAM_PHASE=gigaam
+if (( BENCH_GIGAAM_ONLY )); then
+    BENCH_GIGAAM_PHASE=gigaam-only
+fi
+run_task 0 "$BENCH_GIGA_CONTAINER" gigaam-контейнер.log compare "$@" --phase "$BENCH_GIGAAM_PHASE" --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
+BENCH_COMPLETED=1
 echo "Результаты: $BENCH_RUN_OUT/отчёт.html"

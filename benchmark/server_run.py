@@ -1,4 +1,4 @@
-"""Две фазы: собственный тестовый Whisper, затем полный цикл GigaAM."""
+"""Собственный Whisper и полный GigaAM; GigaAM также запускается отдельно."""
 from __future__ import annotations
 
 import asyncio
@@ -31,7 +31,8 @@ def update(output: Path, rows: list, conditions: dict):
     from benchmark.artifacts import render
 
     compare.write_json(output / "условия.json", conditions)
-    compare.save_reports(output, rows, conditions["state"], mode="standalone-api")
+    mode = "gigaam-only" if conditions.get("mode") == "gigaam_only" else "standalone-api"
+    compare.save_reports(output, rows, conditions["state"], mode=mode)
     render(output, rows, conditions)
 
 
@@ -129,19 +130,79 @@ async def whisper_phase(args) -> int:
 async def gigaam_phase(args) -> int:
     conditions = json.loads((args.out / "условия.json").read_text(encoding="utf-8"))
     rows = load_rows(args.out, conditions)
-    if conditions.get("state") != "Whisper завершён" or not rows or any(row.get("whisper", {}).get("status") != "ok" for row in rows):
+    if args.phase == "gigaam-only":
+        if (conditions.get("mode") != "gigaam_only" or conditions.get("state") != "GigaAM подготовлен"
+                or len(rows) != args.expected_files or any("gigaam" in row for row in rows)):
+            raise ValueError("Для отдельного GigaAM нужен новый подготовленный корпус; повторного запуска фазы нет")
+    elif conditions.get("state") != "Whisper завершён" or not rows or any(row.get("whisper", {}).get("status") != "ok" for row in rows):
         raise ValueError("GigaAM разрешена только после полностью успешной фазы Whisper; повторного запуска фазы нет")
     if conditions.get("mode") == "isolated_whisper_then_gigaam":
         if not (args.out / "логи" / "тестовый-whisper-остановлен.txt").is_file():
             raise ValueError("Перед GigaAM запуск должен остановить тестовый Whisper")
         conditions["whisper_stopped_before_gigaam"] = True
-    conditions["state"] = "GigaAM выполняется"
+    return await run_gigaam(args, rows, conditions)
+
+
+async def gigaam_prepare_phase(args) -> int:
+    """Подготовка того же PCM в CPU-образе Whisper, без модели и запросов ASR."""
+    conditions = {"mode": "gigaam_only", "state": "Подготовка GigaAM",
+                  "started_at": datetime.now().astimezone().isoformat(), "host": compare.host_info(),
+                  "selected_gpu": os.environ.get("BENCH_GPU", "0"), "records": [], "preparations": [],
+                  "whisper": {"enabled": False}, "order": "Только полный цикл GigaAM",
+                  "input": "mono_16000_pcm_s16le", "concurrency": 1,
+                  "timers": {"gigaam": "Полный локальный цикл и отдельно сумма ASR; подготовка, загрузка и прогрев исключены"},
+                  "gigaam": {"model_load_per_record": True, "warmup_per_record": True,
+                             "preparation_included_in_measurements": False},
+                  "guard_policy": {key: os.environ.get(key) for key in
+                                   ("BENCH_GPU_MIN_FREE_MIB", "BENCH_GPU_MAX_UTIL", "BENCH_GPU_RESERVE_MIB", "BENCH_MIN_RAM_MIB")},
+                  "production_service_management": False, "production_requests": False,
+                  "containers_retained": True, "gigaam_external_network": False}
+    rows = []
     try:
-        warm_source = args.warmup_file or Path(rows[0]["audio"].source)
-        warm = compare.prepare_audio(warm_source, args.out / "временные" / "прогрев.wav", max_seconds=args.warmup_seconds)
+        files = sorted(p.resolve() for p in args.audio_dir.rglob("*") if p.is_file() and p.suffix.lower() in compare.FORMATS)
+        if len(files) != args.expected_files:
+            raise ValueError(f"Найдено {len(files)} записей, ожидалось {args.expected_files}; обработка GigaAM не начиналась")
+        temporary = args.out / "временные"
+        temporary.mkdir(exist_ok=True)
+        log.info("Только GigaAM: %d файлов; Whisper и его API не используются; подготовка WAV вне замеров", len(files))
+        for index, source in enumerate(files):
+            directory = f"записи/{index + 1:04d}"
+            (args.out / directory).mkdir(parents=True)
+            target = temporary / f"{index + 1:04d}.wav"
+            audio = compare.prepare_audio(source, target)
+            if audio.seconds > args.max_audio_seconds or target.stat().st_size > 64 * 1024 ** 2:
+                raise ValueError(f"{source.name}: превышен предел {args.max_audio_seconds} с / 64 МиБ; обработка GigaAM не начиналась")
+            row = {"directory": directory, "audio": audio, "order": ["gigaam"]}
+            rows.append(row)
+            conditions["records"].append({"directory": directory, "audio": asdict(audio), "order": row["order"]})
+            log.info("Вход %d: %s; %.3f с, отсчётов %d, SHA256 PCM %s", index + 1, source, audio.seconds, audio.samples, audio.sha256_pcm)
+        warm = compare.prepare_audio(args.warmup_file or files[0], temporary / "прогрев.wav", max_seconds=args.warmup_seconds)
         conditions["warmup"] = {"audio": asdict(warm), "included_in_measurements": False}
+        conditions["state"] = "GigaAM подготовлен"
+        conditions["audio_prepared_at"] = datetime.now().astimezone().isoformat()
+        update(args.out, rows, conditions)
+    except Exception as exc:
+        conditions["state"] = "Остановлен из-за ошибки подготовки GigaAM"
+        conditions["finished_at"] = datetime.now().astimezone().isoformat()
+        log.exception("%s", exc)
+        update(args.out, rows, conditions)
+        return 1
+    return 0
+
+
+async def run_gigaam(args, rows: list, conditions: dict) -> int:
+    conditions["state"] = "GigaAM выполняется"
+    update(args.out, rows, conditions)
+    try:
+        if conditions.get("mode") == "gigaam_only":
+            warm = compare.Audio(**conditions["warmup"]["audio"])
+        else:
+            warm_source = args.warmup_file or Path(rows[0]["audio"].source)
+            warm = compare.prepare_audio(warm_source, args.out / "временные" / "прогрев.wav", max_seconds=args.warmup_seconds)
+            conditions["warmup"] = {"audio": asdict(warm), "included_in_measurements": False}
         for index, row in enumerate(rows):
-            log.info("GigaAM %d/%d: %s; тестовый Whisper уже остановлен, продовые контейнеры не управляются", index + 1, len(rows), row["audio"].source)
+            whisper_state = "Whisper не запускался" if conditions.get("mode") == "gigaam_only" else "тестовый Whisper уже остановлен"
+            log.info("GigaAM %d/%d: %s; %s, продовые контейнеры не управляются", index + 1, len(rows), row["audio"].source, whisper_state)
             payload = await compare.run_worker({"system": "gigaam", "audio": asdict(row["audio"]),
                 "warmup": asdict(warm), "output": str(args.out / row["directory"]), "log_dir": str(args.out),
                 "threads": args.threads, "timeout": args.timeout, "whisper_model": args.whisper_model,
@@ -171,16 +232,21 @@ async def gigaam_phase(args) -> int:
 def main(args, cli) -> int:
     if not args.audio_dir.is_dir() or args.audio_dir == args.out or args.audio_dir in args.out.parents:
         cli.error("Нужна папка аудио; результаты должны находиться вне неё")
-    if args.api_gap < 5:
+    if args.phase == "whisper-api" and args.api_gap < 5:
         cli.error("Пауза между запросами Whisper должна быть не меньше 5 секунд")
-    if args.phase == "whisper-api" and (args.out / "условия.json").exists():
+    if args.phase in {"whisper-api", "gigaam-prepare"} and (args.out / "условия.json").exists():
         cli.error("Прогон уже существует; выберите новую папку")
-    if args.phase == "gigaam" and not (args.out / "условия.json").is_file():
-        cli.error("Нет результатов фазы Whisper")
+    if args.phase in {"gigaam", "gigaam-only"} and not (args.out / "условия.json").is_file():
+        cli.error("Нет подготовленного корпуса" if args.phase == "gigaam-only" else "Нет результатов фазы Whisper")
     args.out.mkdir(parents=True, exist_ok=True)
     compare.setup_logging(args.out)
     try:
-        return asyncio.run(whisper_phase(args) if args.phase == "whisper-api" else gigaam_phase(args))
+        phase = {"whisper-api": whisper_phase, "gigaam": gigaam_phase, "gigaam-only": gigaam_phase,
+                 "gigaam-prepare": gigaam_prepare_phase}[args.phase]
+        return asyncio.run(phase(args))
     except KeyboardInterrupt:
-        log.warning("Прерван пользователем; запрос Whisper не повторяется, сервер может продолжать обработку")
+        if args.phase == "whisper-api":
+            log.warning("Прерван пользователем; запрос Whisper не повторяется, сервер может продолжать обработку")
+        else:
+            log.warning("Прерван пользователем; следующие записи GigaAM не запускаются")
         return 130

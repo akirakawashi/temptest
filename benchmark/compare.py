@@ -192,6 +192,7 @@ def csv_row(row: dict) -> dict:
 
 
 def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None = None) -> None:
+    gigaam_only = mode == "gigaam-only"
     if rows:
         csv_rows = [csv_row(row) for row in rows]
         with (output / "сводка.csv").open("w", encoding="utf-8-sig", newline="") as file:
@@ -199,6 +200,7 @@ def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None
             writer.writeheader()
             writer.writerows(csv_rows)
     pairs = [row for row in rows if all(row.get(s, {}).get("status") == "ok" for s in ("whisper", "gigaam"))]
+    measured = [row for row in rows if row.get("gigaam", {}).get("status") == "ok"] if gigaam_only else pairs
     api_mode = mode in {"api", "standalone-api"} or any(row.get("whisper", {}).get("mode") in {"existing_server_api", "test_server_api"} for row in rows)
     standalone = mode == "standalone-api" or any(row.get("whisper", {}).get("mode") == "test_server_api" for row in rows)
     lines = ["# Сравнение Whisper и полного цикла GigaAM", "", f"Состояние прогона: **{state}**.", "",
@@ -210,6 +212,20 @@ def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None
              f"Записей в корпусе: {len(rows)}. Полностью успешных пар: {len(pairs)}.", "",
              "| Запись | Аудио, с | Whisper, с | GigaAM ASR, с | GigaAM всё, с | Статус Whisper / GigaAM |",
              "|---|---:|---:|---:|---:|---|"]
+    if gigaam_only:
+        replacements = {
+            "# Сравнение Whisper и полного цикла GigaAM": "# Полный цикл GigaAM",
+            "Whisper — faster-whisper large-v3 на CUDA/float16 (если модель не изменена параметром запуска).":
+                "Whisper в этом прогоне не запускается. Его прежние результаты сохраняются отдельно; вход сопоставляется по имени и SHA256 PCM.",
+            "Каждый замер выполняется в отдельном процессе после прогрева; другая система выгружена из GPU.":
+                "Каждый замер GigaAM выполняется в отдельном процессе после загрузки моделей и прогрева. GPU общая с рабочими сервисами.",
+            f"Записей в корпусе: {len(rows)}. Полностью успешных пар: {len(pairs)}.":
+                f"Записей в корпусе: {len(rows)}. Успешных результатов GigaAM: {len(measured)}.",
+            "| Запись | Аудио, с | Whisper, с | GigaAM ASR, с | GigaAM всё, с | Статус Whisper / GigaAM |":
+                "| Запись | Аудио, с | GigaAM ASR, с | GigaAM всё, с | Статус GigaAM |",
+            "|---|---:|---:|---:|---:|---|": "|---|---:|---:|---:|---|",
+        }
+        lines = [replacements.get(line, line) for line in lines]
 
     def fmt(result, key):
         value = result.get(key)
@@ -219,15 +235,20 @@ def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None
         w, g = row.get("whisper", {}), row.get("gigaam", {})
         name = Path(row["audio"].source).name.replace("|", "\\|").replace("\n", " ")
         status = f"{STATUS[w.get('status', 'pending')]} / {STATUS[g.get('status', 'pending')]}"
-        lines.append(f"| [{name}]({row['directory']}/) | {row['audio'].seconds:.3f} | {fmt(w, 'elapsed_seconds')} | "
-                     f"{fmt(g, 'asr_seconds')} | {fmt(g, 'elapsed_seconds')} | {status} |")
-    if pairs:
-        audio_seconds = sum(row["audio"].seconds for row in pairs)
-        lines.extend(["", "Итоги только по полностью успешным парам:", ""])
-        for title, system, key in (("Whisper", "whisper", "elapsed_seconds"),
-                                   ("GigaAM — распознавание", "gigaam", "asr_seconds"),
-                                   ("GigaAM — полный цикл", "gigaam", "elapsed_seconds")):
-            elapsed = sum(row[system][key] for row in pairs)
+        if gigaam_only:
+            lines.append(f"| [{name}]({row['directory']}/) | {row['audio'].seconds:.3f} | "
+                         f"{fmt(g, 'asr_seconds')} | {fmt(g, 'elapsed_seconds')} | {STATUS[g.get('status', 'pending')]} |")
+        else:
+            lines.append(f"| [{name}]({row['directory']}/) | {row['audio'].seconds:.3f} | {fmt(w, 'elapsed_seconds')} | "
+                         f"{fmt(g, 'asr_seconds')} | {fmt(g, 'elapsed_seconds')} | {status} |")
+    if measured:
+        audio_seconds = sum(row["audio"].seconds for row in measured)
+        lines.extend(["", "Итоги только по успешным результатам GigaAM:" if gigaam_only else "Итоги только по полностью успешным парам:", ""])
+        metrics = [("GigaAM — распознавание", "gigaam", "asr_seconds"), ("GigaAM — полный цикл", "gigaam", "elapsed_seconds")]
+        if not gigaam_only:
+            metrics.insert(0, ("Whisper", "whisper", "elapsed_seconds"))
+        for title, system, key in metrics:
+            elapsed = sum(row[system][key] for row in measured)
             lines.append(f"- {title}: {elapsed:.3f} с; время / длительность аудио = {elapsed / audio_seconds:.4f}.")
     lines.extend(["", "Времена строк с ошибкой — время до отказа, они не входят в итоговое сравнение.",
                   "Времена отдельных этапов GigaAM могут пересекаться: их сумма не равна полному времени.",
@@ -322,7 +343,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--timeout", type=positive_int, default=3600, help="Максимальное ожидание подготовки и одного прогона, секунды")
     result.add_argument("--warmup-file", type=Path, help="Отдельная запись с речью для прогрева; по умолчанию первая запись корпуса")
     result.add_argument("--warmup-seconds", type=positive_int, default=30)
-    result.add_argument("--phase", choices=["local", "whisper-api", "gigaam"], default="local")
+    result.add_argument("--phase", choices=["local", "whisper-api", "gigaam", "gigaam-prepare", "gigaam-only"], default="local")
     result.add_argument("--expected-files", type=positive_int, default=int(os.environ.get("BENCH_EXPECTED_FILES", "100")))
     result.add_argument("--api-gap", type=float, default=float(os.environ.get("BENCH_API_GAP", "5")))
     result.add_argument("--api-timeout", type=positive_int, default=int(os.environ.get("BENCH_API_TIMEOUT", "1200")))

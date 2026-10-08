@@ -37,6 +37,31 @@ services:
       - ${BENCH_OUT:?Укажите папку отчётов}:/results
     networks: [whisper]
 
+  audio-prepare:
+    # Тот же PyAV/NumPy, что подготовил WAV для Whisper; без ASR и сети.
+    image: speech-comparison:4.0.0-whisper-standalone
+    platform: linux/amd64
+    entrypoint: ["python", "-m", "benchmark.compare"]
+    command: []
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: 2g
+    network_mode: none
+    environment:
+      NVIDIA_VISIBLE_DEVICES: void
+      BENCH_THREADS: ${BENCH_THREADS:-4}
+      BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
+      BENCH_GPU: ${BENCH_GPU:-0}
+      BENCH_GPU_MIN_FREE_MIB: ${BENCH_GPU_MIN_FREE_MIB:-16384}
+      BENCH_GPU_MAX_UTIL: ${BENCH_GPU_MAX_UTIL:-10}
+      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
+      BENCH_MIN_RAM_MIB: ${BENCH_MIN_RAM_MIB:-20480}
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
+      - ${BENCH_OUT:?Укажите папку отчётов}:/results
+
   whisper-bench:
     image: speech-comparison:4.0.0-whisper-standalone
     platform: linux/amd64

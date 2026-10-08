@@ -184,6 +184,158 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
+@pytest.mark.parametrize("failure", [None, "count", "duration", "warmup"])
+def test_gigaam_only_prepares_new_corpus_without_whisper_and_preserves_previous_results(tmp_path, monkeypatch, failure):
+    import wave
+    from benchmark import pipeline
+
+    source, output = tmp_path / "input", tmp_path / "new-results"
+    source.mkdir()
+    write_wav(source / "1.wav", 100)
+    write_wav(source / "2.wav", 200)
+    if failure == "duration":
+        with wave.open(str(source / "1.wav"), "wb") as wav:
+            wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            wav.writeframes(b'\0\0' * 32000)
+    previous = tmp_path / "old-results" / "записи" / "0001" / "whisper.json"
+    previous.parent.mkdir(parents=True)
+    previous.write_text('{"text":"Сохранённый результат Whisper"}\n')
+    original = previous.read_bytes()
+    calls = install_fake_runners(monkeypatch, warm_giga_status="error" if failure == "warmup" else "ok")
+    forbidden_calls = []
+
+    def forbidden(*args, **kwargs):
+        forbidden_calls.append(args)
+        raise AssertionError("Whisper и его API не должны использоваться")
+
+    monkeypatch.setattr(server_run, "WhisperAPI", forbidden)
+    monkeypatch.setattr(pipeline, "WhisperPipeline", forbidden)
+    args = ["--phase", "gigaam-prepare", "--audio-dir", str(source), "--out", str(output),
+            "--expected-files", "3" if failure == "count" else "2", "--threads", "1", "--api-gap", "0"]
+    if failure == "duration":
+        args.extend(["--max-audio-seconds", "1"])
+    code = compare.main(args)
+    assert code == int(failure in {"count", "duration"})
+    assert not calls
+    if code == 0:
+        args[1] = "gigaam-only"
+        code = compare.main(args)
+    assert code == int(failure is not None)
+    assert not forbidden_calls
+    assert previous.read_bytes() == original
+    assert not list(output.rglob("whisper.json"))
+    conditions = json.loads((output / "условия.json").read_text())
+    assert conditions["mode"] == "gigaam_only" and conditions["whisper"]["enabled"] is False
+    if failure:
+        assert not calls
+        assert conditions["state"].startswith("Остановлен")
+    else:
+        assert [name for name, _ in calls] == ["gigaam", "gigaam"]
+        assert len(list(output.glob("записи/*/gigaam.json"))) == 2
+        assert conditions["state"] == "Завершён"
+        assert all(record["order"] == ["gigaam"] for record in conditions["records"])
+        assert conditions["warmup"]["included_in_measurements"] is False
+        assert "GigaAM — полный цикл: 6.000 с" in (output / "отчёт.md").read_text()
+        assert "1.400 с" in (output / "графики" / "итоги.svg").read_text()
+        assert "3.000 с" in (output / "графики" / "этапы-gigaam.svg").read_text()
+        assert "успешных результатов GigaAM: 2" in (output / "отчёт.html").read_text()
+        with pytest.raises(ValueError, match="повторного запуска"):
+            compare.main(args)
+        args[1] = "gigaam-prepare"
+        with pytest.raises(SystemExit) as error:
+            compare.main(args)
+        assert error.value.code == 2
+    artifacts.finalize(output, code)
+    assert not (output / "временные").exists()
+    with tarfile.open(output / "диагностика.tar.gz") as archive:
+        assert "отчёт.html" in archive.getnames()
+        assert not any(name.endswith(("whisper.json", ".wav")) for name in archive.getnames())
+    if not failure:
+        assert "GigaAM — полный цикл: 6.000 с" in (output / "отчёт.md").read_text()
+
+
+@pytest.mark.parametrize("failure", [None, "build", "prefetch", "gigaam", "whisper-running", "hup"])
+def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_path, failure):
+    folder = tmp_path / "stand"
+    (folder / "benchmark").mkdir(parents=True)
+    (folder / "audio").mkdir()
+    script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
+    (folder / "benchmark" / "run.sh").write_bytes(script.read_bytes())
+    previous = folder / "benchmark-results" / "previous" / "whisper.json"
+    previous.parent.mkdir(parents=True)
+    previous.write_text("Сохранённый Whisper")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    ready = tmp_path / "gigaam-ready"
+    docker = bin_dir / "docker"
+    docker.write_text('#!/usr/bin/env python3\nimport os,sys,time\nfrom pathlib import Path\na=sys.argv[1:]; failure=os.environ["FAILURE"]\n'
+                      'with open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
+                      'if a[0]=="compose" and "ps" in a and failure=="whisper-running": print("own-whisper-id")\n'
+                      'if a[0]=="compose" and "build" in a and failure=="build": sys.exit(23)\n'
+                      'if a[0]=="info": print("/tmp")\n'
+                      'if a[0]=="wait":\n'
+                      ' if "-gigaam-" in a[-1] and failure=="hup":\n'
+                      '  Path(os.environ["READY"]).touch()\n'
+                      '  while True: time.sleep(60)\n'
+                      ' print(51 if "-prefetch-" in a[-1] and failure=="prefetch" else 47 if "-gigaam-" in a[-1] and failure=="gigaam" else 0)\n'
+                      'if a[0]=="logs" and "--follow" in a:\n'
+                      ' print("Тест: журнал GigaAM",flush=True)\n'
+                      ' while True: time.sleep(60)\n'
+                      'sys.exit(0)\n')
+    nvidia = bin_dir / "nvidia-smi"
+    nvidia.write_text('#!/usr/bin/env python3\nimport sys\na=" ".join(sys.argv)\n'
+                      'print("14600" if "--query-gpu=memory.free" in a else "100" if "--query-gpu=utilization.gpu" in a else "2026/10/08, uuid, 100, 1000, 14600, 95830, 80, 32")\n')
+    docker.chmod(0o755)
+    nvidia.chmod(0o755)
+    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
+           "FAILURE": failure or "", "READY": str(ready), "BENCH_GPU_MIN_FREE_MIB": "12288",
+           "BENCH_GPU_MAX_UTIL": "100", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
+    with (tmp_path / "terminal.log").open("w") as terminal:
+        process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio"),
+                                    "--gigaam-only", "--expected-files", "2"], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=terminal, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            if failure == "hup":
+                import time
+                deadline = time.monotonic() + 10
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert ready.exists()
+                os.killpg(process.pid, signal.SIGHUP)
+            code = process.wait(timeout=15)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+    assert code == {None: 0, "build": 23, "prefetch": 51, "gigaam": 47, "whisper-running": 42, "hup": 129}[failure]
+    assert previous.read_text() == "Сохранённый Whisper"
+    commands = [ast.literal_eval(line) for line in command_log.read_text().splitlines()]
+    for command in commands:
+        assert not any(name in str(command) for name in ("whisper-asr", "model-proxy", "vllm", "10.220.21.2"))
+        assert not {"--rm", "--remove-orphans", "rm", "down"} & set(command)
+        assert not any(name in str(command) for name in ("whisper-download", "whisper-api"))
+        if "whisper-client" in command:
+            assert command[0] == "compose" and "build" in command
+        if "whisper-bench" in command:
+            assert command[0] == "compose" and "ps" in command
+        if command[0] == "compose" and command[1:] != ["version"]:
+            assert command[command.index("--project-name") + 1] == "speech-comparison"
+    gigaam_runs = [c for c in commands if c[0] == "compose" and "run" in c and "gigaam-only" in c]
+    assert bool(gigaam_runs) is (failure not in {"build", "prefetch", "whisper-running"})
+    if gigaam_runs:
+        assert "--expected-files" in gigaam_runs[0] and "2" in gigaam_runs[0]
+        assert "compare" in gigaam_runs[0] and "--detach" in gigaam_runs[0]
+        preparation = next(c for c in commands if "audio-prepare" in c and "run" in c)
+        assert "gigaam-prepare" in preparation
+        assert commands.index(preparation) < commands.index(gigaam_runs[0])
+    logs = list((folder / "benchmark-results").glob("*/логи/запуск.log"))
+    assert len(logs) == 1
+    if failure == "hup":
+        assert "Получен SIGHUP" in logs[0].read_text()
+        assert "Завершение: код 129" in logs[0].read_text()
+
+
 @pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console", [
     (*case, False, False) for case in [
     (14600, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0, 0, 0),
