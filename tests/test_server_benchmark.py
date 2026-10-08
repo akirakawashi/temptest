@@ -1,7 +1,6 @@
 """Без запросов на рабочий сервер, Docker, скачиваний и GPU inference."""
 import ast
 import asyncio
-from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -516,10 +515,11 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
             assert "'stop', 'ollama'" in commands
             waits = [ast.literal_eval(line) for line in commands.splitlines()
                      if ast.literal_eval(line)[0] == "wait"]
-            assert len(waits) == 4
+            assert len(waits) == 5
             assert all(task[1].startswith(prefix) for task, prefix in zip(waits, (
                 "speech-comparison-whisper-download-", "speech-comparison-client-",
-                "speech-comparison-prefetch-", "speech-comparison-gigaam-"), strict=True))
+                "speech-comparison-prefetch-", "speech-comparison-gigaam-", "speech-comparison-first-line-"), strict=True))
+            assert commands.index("'stop', 'ollama'") < commands.index("gigaam-first-line")
     if whisper_download_exit:
         assert "whisper-api" not in commands and "'up', '-d', '--wait', '--wait-timeout', '600', 'whisper-bench'" not in commands
         download_logs = list((folder / "benchmark-results").glob("*/логи/загрузка-whisper.log"))
@@ -595,6 +595,13 @@ def test_download_network_never_reaches_audio_processing_containers(tmp_path, do
     assert services["ollama"]["environment"]["OLLAMA_KV_CACHE_TYPE"] == cache
     assert services["ollama"]["environment"]["OLLAMA_FLASH_ATTENTION"] == "1"
     assert "OLLAMA_KV_CACHE_TYPE" not in services["ollama-download"]["environment"]
+    first_line = services["first-line"]
+    assert first_line["network_mode"] == "none" and not first_line.get("depends_on")
+    assert not first_line.get("ports") and not first_line.get("networks")
+    assert first_line["deploy"] == services["compare"]["deploy"]
+    for key in ("VAD_THRESHOLD", "VAD_MIN_SILENCE", "VAD_MIN_SPEECH", "VAD_MAX_SPEECH", "BENCH_THREADS"):
+        assert first_line["environment"][key] == services["compare"]["environment"][key]
+    assert all(first_line["environment"][key] == "false" for key in ("EMO_ENABLED", "LLM_ENABLED", "SPLIT_TURNS"))
 
 
 @pytest.mark.parametrize("url", ["http://10.220.21.2:8002/v1", "http://localhost:9000/v1", "https://api.openai.com/v1"])

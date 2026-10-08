@@ -68,6 +68,7 @@ case "$BENCH_OUT/" in "$BENCH_AUDIO_DIR/"*) echo 'Отчёты должны бы
 case "$BENCH_CACHE/" in "$BENCH_AUDIO_DIR/"*) echo 'Кеш должен быть вне папки записей' >&2; exit 2 ;; esac
 BENCH_RUN_OUT="$BENCH_OUT/$BENCH_RUN_ID"
 BENCH_GIGA_CONTAINER="speech-comparison-gigaam-$BENCH_RUN_ID"
+BENCH_FIRST_LINE_CONTAINER="speech-comparison-first-line-$BENCH_RUN_ID"
 BENCH_PREFETCH_CONTAINER="speech-comparison-prefetch-$BENCH_RUN_ID"
 BENCH_PREPARE_CONTAINER="speech-comparison-audio-prepare-$BENCH_RUN_ID"
 BENCH_CLIENT_CONTAINER="speech-comparison-client-$BENCH_RUN_ID"
@@ -190,6 +191,7 @@ cleanup() {
         wait "$BENCH_MONITOR_PID" 2>/dev/null || true
     fi
     docker stop --time 10 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
+    docker stop --time 10 "$BENCH_FIRST_LINE_CONTAINER" >/dev/null 2>&1 || true
     docker stop --time 10 "$BENCH_PREFETCH_CONTAINER" >/dev/null 2>&1 || true
     if (( BENCH_GIGAAM_ONLY )); then
         docker stop --time 10 "$BENCH_PREPARE_CONTAINER" >/dev/null 2>&1 || true
@@ -248,7 +250,7 @@ gpu_monitor() {
             echo "$sample, $phase" >> "$BENCH_RUN_OUT/логи/gpu.csv"
             free=$(awk -F, '{gsub(/ /,"",$5); print $5}' <<< "$sample")
         fi
-        if [[ "$phase" == 'GigaAM' || "$phase" == 'Whisper' ]]; then
+        if [[ "$phase" == 'GigaAM' || "$phase" == 'GigaAM первая линия' || "$phase" == 'Whisper' ]]; then
             if [[ ! "$free" =~ ^[0-9]+$ ]]; then
                 reason='Не удалось проверить свободную память GPU; останавливаем только стенд'
             elif (( free < BENCH_GPU_RESERVE_MIB )); then
@@ -258,6 +260,8 @@ gpu_monitor() {
                 echo "$reason" | tee "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt"
                 if [[ "$phase" == 'Whisper' ]]; then
                     bench_compose stop whisper-bench >/dev/null 2>&1 || true
+                elif [[ "$phase" == 'GigaAM первая линия' ]]; then
+                    docker stop --time 5 "$BENCH_FIRST_LINE_CONTAINER" >/dev/null 2>&1 || true
                 else
                     docker stop --time 5 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
                     bench_compose stop ollama >/dev/null 2>&1 || true
@@ -288,7 +292,8 @@ if (( BENCH_GIGAAM_ONLY )); then
     echo "Прогон $BENCH_RUN_ID: только полный цикл GigaAM; GPU $BENCH_GPU."
     echo 'Whisper не запускается; его предыдущие результаты остаются в прежней папке.'
 else
-    echo "Прогон $BENCH_RUN_ID: собственный Whisper → остановка Whisper → полный GigaAM; GPU $BENCH_GPU."
+    echo "Прогон $BENCH_RUN_ID: собственный Whisper → полный GigaAM → GigaAM первая линия; GPU $BENCH_GPU."
+    echo 'Первая линия: только VAD и ASR, без CAM++, эмоций и GigaChat; тот же смешанный корпус, тот же моно WAV.'
     echo 'Адрес Whisper: только whisper-bench:9000 внутри стенда. API и ключи прода не используются.'
 fi
 echo "Сеть сборки образов: $BENCH_BUILD_NETWORK."
@@ -341,7 +346,7 @@ else
     bench_compose up -d --wait --wait-timeout 600 whisper-bench
     [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
     run_task 0 "$BENCH_CLIENT_CONTAINER" whisper-клиент.log whisper-client "$@" \
-        --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+        --include-first-line --phase whisper-api --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
     stop_test_whisper
     echo 'Whisper завершён' > "$BENCH_RUN_OUT/логи/этап.txt"
 fi
@@ -374,5 +379,21 @@ if (( BENCH_GIGAAM_ONLY )); then
 fi
 run_task 0 "$BENCH_GIGA_CONTAINER" gigaam-контейнер.log compare "$@" --phase "$BENCH_GIGAAM_PHASE" --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
 [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
+if (( ! BENCH_GIGAAM_ONLY )); then
+    echo 'Полный GigaAM завершён' > "$BENCH_RUN_OUT/логи/этап.txt"
+    # Следующий режим не должен делить GPU с собственной LLM стенда.
+    bench_compose stop ollama
+    bench_compose logs --no-color --since "$BENCH_STARTED_AT" ollama > "$BENCH_RUN_OUT/логи/ollama.log" 2>&1
+    BENCH_OLLAMA_STARTED=0
+    echo 'Тестовая Ollama остановлена перед первой линией' > "$BENCH_RUN_OUT/логи/тестовая-ollama-остановлена.txt"
+    if ! check_capacity; then
+        echo 'Первая линия не запускается: ресурсы изменились; результаты Whisper и полного GigaAM сохранены.'
+        exit 42
+    fi
+    echo 'GigaAM первая линия' > "$BENCH_RUN_OUT/логи/этап.txt"
+    run_task 0 "$BENCH_FIRST_LINE_CONTAINER" первая-линия-контейнер.log first-line "$@" \
+        --phase gigaam-first-line --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+    [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || exit 42
+fi
 BENCH_COMPLETED=1
 echo "Результаты: $BENCH_RUN_OUT/отчёт.html"

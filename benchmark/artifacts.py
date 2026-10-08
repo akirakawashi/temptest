@@ -41,7 +41,7 @@ def gpu_chart(output: Path) -> str | None:
     return '\n'.join(parts + ['</svg>'])
 
 
-def svg_bars(title: str, entries: list[tuple], *, grouped=False, legend=None) -> str:
+def svg_bars(title: str, entries: list[tuple], *, grouped=False, legend=None, unit="с") -> str:
     height = 95 + len(entries) * (45 if grouped else 35)
     values = [v for _, series in entries for v in series if v is not None]
     maximum = max(values, default=1) or 1
@@ -60,11 +60,17 @@ def svg_bars(title: str, entries: list[tuple], *, grouped=False, legend=None) ->
             y = top + sub * 11 if grouped else top
             width = value / maximum * 600
             parts.append(f'<rect x="380" y="{y}" width="{width:.2f}" height="{8 if grouped else 18}" fill="{COLORS[sub if grouped else index % 3]}"/>')
-            parts.append(f'<text x="{387 + width:.2f}" y="{y + 9 if grouped else y + 14}" font-family="sans-serif" font-size="11">{value:.3f} с</text>')
+            parts.append(f'<text x="{387 + width:.2f}" y="{y + 9 if grouped else y + 14}" font-family="sans-serif" font-size="11">{value:.3f} {unit}</text>')
     return "\n".join(parts + ["</svg>"])
 
 
 def render(output: Path, rows: list, conditions: dict):
+    from benchmark.summary import write_summary
+
+    summary = write_summary(output, rows, conditions)
+    if "gigaam_first_line" in conditions.get("planned_systems", []):
+        render_three_systems(output, rows, conditions, summary)
+        return
     folder = output / "графики"
     folder.mkdir(exist_ok=True)
     gigaam_only = conditions.get("mode") == "gigaam_only"
@@ -119,6 +125,73 @@ def render(output: Path, rows: list, conditions: dict):
             'график GPU показывает суммарную загрузку всех процессов.</p>'
             + llm_note
             + ''.join(f'<div class="chart">{svg}</div>' for svg in charts.values()) + '</html>')
+    (output / "отчёт.html").write_text(html, encoding="utf-8")
+
+
+def render_three_systems(output: Path, rows: list, conditions: dict, summary: dict):
+    from benchmark.summary import SYSTEMS
+
+    folder = output / "графики"
+    folder.mkdir(exist_ok=True)
+    def stat(system, key):
+        return summary["systems"][system]["processing_seconds"].get(key)
+    charts = {
+        "среднее-время.svg": svg_bars("Среднее измеренное время успешной записи", [(name, [stat(s, "mean")]) for s, name in SYSTEMS.items()]),
+        "за-15-минут.svg": svg_bars("За 15 минут: по среднему времени этого смешанного корпуса", [(name, [summary["systems"][s]["records_per_15_minutes"]]) for s, name in SYSTEMS.items()], unit="записей"),
+        "по-записям.svg": svg_bars("Три режима: обработка каждой записи", [
+            (f"{Path(r['directory']).name} · {Path(r['audio'].source).name}",
+             [r.get(s, {}).get("elapsed_seconds") if r.get(s, {}).get("status") == "ok" else None for s in SYSTEMS]) for r in rows],
+            grouped=True, legend=list(SYSTEMS.values())),
+    }
+    names = {"vad": "Поиск речи", "asr": "Распознавание", "speaker": "Голоса", "emotion": "Эмоции", "llm": "GigaChat",
+             "parallel": "Одновременная работа этапов", "other": "Очередь, подача звука и вспомогательная работа"}
+    for system, filename in (("gigaam", "gigaam"), ("gigaam_first_line", "первая-линия")):
+        entry = summary["systems"][system]
+        charts[f"этапы-{filename}.svg"] = svg_bars(f"{SYSTEMS[system]}: вызовы этапов, время может пересекаться", [
+            (names[k], [v["seconds"].get("mean")]) for k, v in entry["stages"].items() if v["enabled"]])
+        if "mean_record_wall_percent" in entry:
+            charts[f"проценты-{filename}.svg"] = svg_bars(f"{SYSTEMS[system]}: средние доли времени записи, сумма 100%", [
+                (names[key], [value]) for key, value in entry["mean_record_wall_percent"].items() if value > 0], unit="%")
+    gpu = gpu_chart(output)
+    if gpu:
+        charts["gpu.svg"] = gpu
+    for filename, svg in charts.items():
+        (folder / filename).write_text(svg, encoding="utf-8")
+    cards = []
+    for system, name in SYSTEMS.items():
+        entry = summary["systems"][system]
+        average, total, rate = stat(system, "mean"), stat(system, "total"), entry["records_per_15_minutes"]
+        cards.append(f'<article><h2>{name}</h2><p>Успешно: <b>{entry["statuses"]["ok"]} из {len(rows)}</b></p>'
+                     f'<p>Среднее: <b>{average:.2f} с</b>; сумма: {total:.2f} с.</p><p>За 15 минут: около <b>{rate:.0f} записей</b>.</p></article>'
+                     if average is not None else f'<article><h2>{name}</h2><p>Измерения ещё не получены.</p></article>')
+    texts = []
+    for row in rows:
+        texts.append(f'<details><summary>{escape(Path(row["audio"].source).name)}</summary><div class="cards">')
+        for system, name in SYSTEMS.items():
+            result = row.get(system, {})
+            plain = "\n".join(u["text"] for u in result.get("utterances", [])) or result.get("text", "")
+            texts.append(f'<article><h3>{name}</h3><p>Статус: {escape(result.get("status", "pending"))}</p><pre>{escape(plain)}</pre></article>')
+        texts.append('</div></details>')
+    changes = summary["matched_comparison"].get("time_change_vs_whisper_percent", {})
+    comparison = " ".join(f'{SYSTEMS[system]}: {value:+.1f}% времени относительно Whisper.' for system, value in changes.items() if system != "whisper")
+    html = ('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'
+        '<title>Три режима обработки разговоров</title><style>'
+        'body{font:16px/1.6 sans-serif;margin:24px;background:#0b1018;color:#edf3ff}.cards{display:flex;gap:16px;flex-wrap:wrap}'
+        'article{background:#131c29;border:1px solid #34445a;padding:18px;border-radius:12px;flex:1;min-width:240px}'
+        'pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.6 sans-serif}svg{max-width:100%;height:auto;border-radius:12px}'
+        '.chart{margin:24px 0}details{border:1px solid #34445a;border-radius:12px;padding:16px;margin:12px 0}summary{cursor:pointer}'
+        '</style><h1>Whisper, полный GigaAM и первая линия</h1>'
+        f'<p>Состояние: {escape(conditions["state"])}. Корпус: {len(rows)} записей. Общая длительность: {summary["audio_seconds"] / 60:.1f} мин.</p>'
+        '<p>Первая линия: только поиск речи и распознавание. Голоса, эмоции и GigaChat отключены; её контейнер не имеет сети.</p>'
+        '<p>Во всех трёх режимах используется одна моно копия каждой записи. Роли из исходных каналов здесь не восстанавливаются.</p>'
+        '<p>Загрузка, прогрев, тестовые паузы и запись отчёта исключены из времени обработки. За 15 минут — расчёт для похожего набора после подготовки моделей.</p>'
+        + '<div class="cards">' + ''.join(cards) + '</div>'
+        + f'<p>Для сравнения полностью успешно обработано всеми тремя режимами: {summary["matched_comparison"]["records"]}. {comparison}</p>'
+        + '<p>GPU общая с рабочими сервисами. Их нагрузка влияет на время. Скорость не показывает точность распознавания.</p>'
+        + ''.join(f'<div class="chart">{svg}</div>' for svg in charts.values())
+        + '<h2>Тексты трёх систем</h2><p>Различия нужно проверять по записи: эталонные расшифровки в этом тесте не задавались.</p>'
+        + ''.join(texts) + '<p>Подробности: итоги.json, условия.json, замеры.csv, сводка.csv и журналы каждого рабочего процесса.</p></html>')
     (output / "отчёт.html").write_text(html, encoding="utf-8")
 
 

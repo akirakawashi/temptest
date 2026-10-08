@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+from datetime import datetime
 import json
 import logging
 from pathlib import Path
@@ -104,6 +105,8 @@ class WhisperAPI:
         log.info("Whisper API: один POST, файл %s, байт %d, параметры %s; повторов нет", path.name, path.stat().st_size, parameters)
         started = time.perf_counter()
         result = {"status": "error", "text": "", "segments": [], "error": None,
+                  "request_started_at": datetime.now().astimezone().isoformat(),
+                  "input_bytes": path.stat().st_size, "audio_seconds": duration,
                   "mode": "test_server_api" if self.standalone else "existing_server_api", "endpoint": self.base_url + "/audio/transcriptions",
                   "request_parameters": parameters, "attempts": 1,
                   "timer_boundary": "HTTP-запрос: передача WAV, очередь, обработка, получение ответа",
@@ -150,4 +153,5 @@ class WhisperAPI:
                 result["error"] = result["error"].replace(self.key, "[КЛЮЧ СКРЫТ]")
             result["server_may_still_be_processing"] = isinstance(exc, httpx.TransportError)
             log.error("Whisper API: %s. Автоматического повтора нет; после обрыва сервер может продолжать обработку", result["error"])
+        result["request_finished_at"] = datetime.now().astimezone().isoformat()
         return result

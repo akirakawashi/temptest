@@ -15,7 +15,7 @@ import numpy as np
 from app.config import SAMPLE_RATE, Settings
 from benchmark.gpu import CudaEngines, configure_whisper_vad
 from app.llm import LLM
-from app.session import Session
+from app.session import Session, tokens_to_words, words_text
 from benchmark.llm_settings import llm_runtime
 
 log = logging.getLogger("сравнение")
@@ -37,6 +37,7 @@ class StageTimer:
         with self.lock:
             self.values = {stage: {"seconds": 0.0, "calls": 0, "errors": 0} for stage in STAGES}
             self.details = []
+            self.segments = []
             self.origin = None
 
     def measure(self, stage: str, call: Callable, *, audio_seconds: float | None = None):
@@ -47,7 +48,7 @@ class StageTimer:
         try:
             result = call()
             if stage == "asr":
-                detail.update(text=result[0], tokens=len(result[1]))
+                detail.update(text=result[0], tokens=list(result[1]), token_timestamps=list(result[2]))
             elif stage == "emotion":
                 detail["probabilities"] = result
             return result
@@ -61,8 +62,7 @@ class StageTimer:
                 entry["seconds"] += elapsed
                 entry["calls"] += 1
                 entry["errors"] += int(failed)
-                if stage != "vad":
-                    self.details.append({**detail, "seconds": elapsed, "error": failed})
+                self.details.append({**detail, "seconds": elapsed, "error": failed})
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -84,10 +84,84 @@ class TimedVad:
         return getattr(self.vad, name)
 
     def accept(self, samples):
-        return self.timer.measure("vad", lambda: self.vad.accept(samples))
+        return self._remember(self.timer.measure("vad", lambda: self.vad.accept(samples),
+                                                audio_seconds=len(samples) / SAMPLE_RATE))
 
     def flush(self):
-        return self.timer.measure("vad", self.vad.flush)
+        return self._remember(self.timer.measure("vad", self.vad.flush))
+
+    def _remember(self, segments):
+        for seg in segments:
+            self.timer.segments.append({"start": seg.start / SAMPLE_RATE, "end": seg.end / SAMPLE_RATE,
+                "voice_start": (seg.start + seg.lead) / SAMPLE_RATE,
+                "voice_end": (seg.end - seg.trail) / SAMPLE_RATE,
+                "lead_seconds": seg.lead / SAMPLE_RATE, "trail_seconds": seg.trail / SAMPLE_RATE,
+                "probabilities": [round(float(p), 4) for p in seg.probs]})
+        return segments
+
+
+def wall_time_breakdown(calls: list[dict], elapsed: float) -> dict:
+    """Разбивка 100% времени: пересечения вынесены отдельно, двойного счёта нет."""
+    boundaries = [(0.0, None, 0), (elapsed, None, 0)]
+    buckets = {key: 0.0 for key in (*STAGES, "llm", "parallel", "other")}
+    for call in calls:
+        a = max(0.0, min(elapsed, call["offset_seconds"]))
+        b = max(a, min(elapsed, a + call["seconds"]))
+        boundaries.extend([(a, call["stage"], 1), (b, call["stage"], -1)])
+    active = {}
+    previous = 0.0
+    for at, stage, change in sorted(boundaries, key=lambda entry: entry[0]):
+        stages = [key for key, count in active.items() if count]
+        key = stages[0] if len(stages) == 1 else "parallel" if stages else "other"
+        buckets[key] += at - previous
+        if stage is not None:
+            active[stage] = active.get(stage, 0) + change
+        previous = at
+    return {"exclusive_wall_seconds": buckets,
+            "exclusive_wall_percent": {key: seconds / elapsed * 100 if elapsed else 0 for key, seconds in buckets.items()},
+            "method": "Интервалы perf_counter; пересечения моделей — parallel, работа между вызовами — other; сумма 100%"}
+
+
+def vad_pauses(segments: list[dict], audio_seconds: float) -> list[dict]:
+    """Промежутки вне VAD-речи, включая начало и конец; это оценка детектора."""
+    pauses, previous = [], 0.0
+    for seg in segments:
+        start = min(audio_seconds, max(0.0, seg["voice_start"]))
+        end = min(audio_seconds, max(start, seg["voice_end"]))
+        if start > previous:
+            pauses.append({"start": previous, "end": start, "seconds": start - previous})
+        previous = max(previous, end)
+    if previous < audio_seconds:
+        pauses.append({"start": previous, "end": audio_seconds, "seconds": audio_seconds - previous})
+    return pauses
+
+
+class FirstLineSession(Session):
+    """Тот же поток VAD/очередь ASR, без вызовов голоса и эмоций."""
+
+    def _live_guess(self) -> None:
+        pass
+
+    def _process(self, seg, clusterer, split_turns, prev_end, prev_speaker) -> dict:
+        started = time.perf_counter()
+        text, tokens, stamps = self.eng.transcribe(seg.samples)
+        if not any(ch.isalnum() for ch in text):
+            return {"turns": [], "merges": []}
+        duration = len(seg.samples) / SAMPLE_RATE
+        words = tokens_to_words(tokens, stamps, duration)
+        voice_start = (seg.start + seg.lead) / SAMPLE_RATE
+        voice_end = (seg.end - seg.trail) / SAMPLE_RATE
+        return {"merges": [], "turns": [{"speaker": None, "emotion": None, "interrupted": None,
+            "start": seg.start / SAMPLE_RATE, "end": seg.end / SAMPLE_RATE,
+            "voice_start": voice_start, "voice_end": voice_end,
+            "gap": None if prev_end is None else max(0.0, voice_start - prev_end),
+            "text": words_text(words) if words else text.strip(), "words": len(words),
+            "word_timestamps": [{"text": w["w"], "start": seg.start / SAMPLE_RATE + w["s"],
+                                 "end": seg.start / SAMPLE_RATE + w["e"]} for w in words],
+            "asr_ms": (time.perf_counter() - started) * 1000, "diar_ms": 0, "_audio": seg.samples}]}
+
+    def transcript(self) -> str:
+        return "\n".join(u["text"] for u in self.utterances)
 
 
 class TimedEngines(CudaEngines):
@@ -160,6 +234,7 @@ class WhisperPipeline:
 
 
 class GigaPipeline:
+    first_line = False
     def __init__(self, cfg: Settings, threads: int, timeout: float, seed: int = 42):
         self.cfg, self.threads, self.timeout, self.seed = cfg, threads, timeout, seed
         self.llm_runtime = llm_runtime(threads, cfg, seed)
@@ -192,6 +267,7 @@ class GigaPipeline:
         self.events = []
         analysis = None
         llm_seconds = 0.0
+        llm_offset = None
         session = None
         status, error = "ok", None
         started = time.perf_counter()
@@ -204,7 +280,8 @@ class GigaPipeline:
 
         try:
             async with asyncio.timeout(self.timeout):
-                session = Session(self.engines, self.cfg, emit)
+                session_type = FirstLineSession if self.first_line else Session
+                session = session_type(self.engines, self.cfg, emit)
                 session.start()
                 # Вход тот же, что у микрофона. Скорость подачи не привязана к часам.
                 pcm = (np.clip(samples, -1, 32767 / 32768) * 32768).astype("<i2")
@@ -218,12 +295,13 @@ class GigaPipeline:
                     raise RuntimeError("; ".join(failures))
                 missing = [u["id"] for u in session.utterances
                            if u["end"] - u["start"] >= 0.5 and u.get("emotion") is None]
-                if missing:
+                if missing and not self.first_line:
                     raise RuntimeError(f"Не получены обязательные эмоции для реплик: {missing}")
                 if not session.utterances:
                     status = "no_speech"
-                else:
+                elif not self.first_line:
                     llm_started = time.perf_counter()
+                    llm_offset = llm_started - started
                     try:
                         await self.llm.analyze(
                             session.transcript(), emit,
@@ -249,13 +327,26 @@ class GigaPipeline:
         stages = self.engines.timer.snapshot()
         utterances = list(session.utterances) if session else []
         transcript = session.transcript() if session else ""
+        counters = session.counters() if session else {}
+        calls = self.engines.timer.trace()
+        if llm_offset is not None:
+            calls.append({"stage": "llm", "offset_seconds": llm_offset, "seconds": llm_seconds,
+                          "error": status != "ok", "thread": threading.current_thread().name})
+        speech_segments = list(self.engines.timer.segments)
+        pauses = vad_pauses(speech_segments, len(samples) / SAMPLE_RATE)
         if session:
             await session.close()
         return {
             "status": status, "elapsed_seconds": elapsed, "asr_seconds": stages["asr"]["seconds"],
-            "stages": stages, "stage_calls": self.engines.timer.trace(), "llm_seconds": llm_seconds, "text": transcript,
+            "pipeline": "first_line" if self.first_line else "full",
+            "enabled_stages": ["vad", "asr"] if self.first_line else [*STAGES, "llm"],
+            "stages": stages, "stage_calls": calls, "llm_seconds": llm_seconds, "text": transcript,
             "utterances": utterances, "analysis": analysis, "events": list(self.events), "error": error,
-            "emotions_skipped_short": sum(u.get("emotion") is None for u in utterances),
+            "emotions_skipped_short": None if self.first_line else sum(u.get("emotion") is None for u in utterances),
+            "counters": counters, "speech_segments": speech_segments, "pauses": pauses,
+            "pause_seconds": sum(p["seconds"] for p in pauses),
+            "timing": {"audio_processing_seconds": elapsed - llm_seconds, "llm_seconds": llm_seconds,
+                       **wall_time_breakdown(calls, elapsed)},
         }
 
     async def gpu_model_info(self) -> list[dict]:
@@ -295,6 +386,25 @@ class GigaPipeline:
         for name in ("_asr", "_spk", "_emo", "_vad_sess"):
             setattr(self.engines, name, None)
         gc.collect()
+
+
+class FirstLinePipeline(GigaPipeline):
+    first_line = True
+
+    def __init__(self, cfg: Settings, threads: int, timeout: float):
+        if cfg.emo_enabled or cfg.llm_enabled or cfg.split_turns:
+            raise ValueError("Первая линия требует отключить голоса, эмоции и GigaChat")
+        self.cfg, self.threads, self.timeout = cfg, threads, timeout
+        self.llm_runtime = None
+        self.llm = None
+        self.engines = TimedEngines(cfg)
+        self.events = []
+
+    async def load(self) -> None:
+        await asyncio.to_thread(self.engines.load_core, speaker_enabled=False)
+        if any(self.engines.components[key].state != "ready" for key in ("vad", "asr")):
+            raise RuntimeError(f"Не загрузились VAD/ASR первой линии: {self.engines.status()}")
+        log.info("GigaAM первая линия: только VAD и ASR на CUDA; CAM++, эмоции и GigaChat не загружаются")
 
 
 def versions() -> dict:

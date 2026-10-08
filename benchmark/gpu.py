@@ -34,7 +34,7 @@ def sherpa_runtime_version(sherpa) -> str:
     return library.OrtGetApiBase().contents.get_version().decode("ascii")
 
 
-def log_gpu_memory(stage: str) -> None:
+def log_gpu_memory(stage: str) -> dict:
     import torch
 
     free, total = torch.cuda.mem_get_info(0)
@@ -46,6 +46,9 @@ def log_gpu_memory(stage: str) -> None:
     if free / mib < reserve:
         raise RuntimeError(f"После {stage} свободно {free / mib:.0f} МиБ GPU, нужен резерв {reserve} МиБ. "
                            "Останавливаем только стенд; рабочий Whisper не управляется")
+    return {"free_mib": free / mib, "total_mib": total / mib,
+            "torch_allocated_mib": torch.cuda.memory_allocated(0) / mib,
+            "torch_reserved_mib": torch.cuda.memory_reserved(0) / mib}
 
 
 def gpu_info() -> dict:
@@ -105,30 +108,34 @@ class CudaEngines(Engines):
     исходной Session возвращаются те же токены SentencePiece и их времена.
     """
 
-    def load_core(self) -> None:
+    def load_core(self, *, speaker_enabled: bool = True) -> None:
         log.info("GigaAM: начало импорта официального пакета")
         import gigaam
-        log.info("GigaAM: официальный пакет импортирован; начало импорта sherpa-onnx")
-        import sherpa_onnx
+        log.info("GigaAM: официальный пакет импортирован")
         import torch
         import onnxruntime as ort
 
-        native_ort = sherpa_runtime_version(sherpa_onnx)
-        self.versions["sherpa-onnx-runtime"] = native_ort
-        log.info("GigaAM: sherpa-onnx %s, его ONNX Runtime %s; PyTorch %s",
-                 sherpa_onnx.__version__, native_ort, torch.__version__)
-        if native_ort != ort.__version__:
-            raise RuntimeError(f"Несовместимые ONNX Runtime: sherpa-onnx использует {native_ort}, "
-                               f"Python — {ort.__version__}. CUDA-сборки должны использовать одну версию Runtime")
+        if speaker_enabled:
+            log.info("GigaAM: начало импорта sherpa-onnx для CAM++")
+            import sherpa_onnx
+
+            native_ort = sherpa_runtime_version(sherpa_onnx)
+            self.versions["sherpa-onnx-runtime"] = native_ort
+            if native_ort != ort.__version__:
+                raise RuntimeError(f"Несовместимые ONNX Runtime: sherpa-onnx использует {native_ort}, "
+                                   f"Python — {ort.__version__}. CUDA-сборки должны использовать одну версию Runtime")
+            if "+cuda12" not in sherpa_onnx.__version__:
+                raise RuntimeError("Для CAM++ требуется CUDA 12/cuDNN 9 сборка sherpa-onnx")
+            self.versions["sherpa-onnx"] = sherpa_onnx.__version__
+        log.info("GigaAM: ONNX Runtime %s; PyTorch %s; CAM++ %s",
+                 ort.__version__, torch.__version__, "включён" if speaker_enabled else "отключён")
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA недоступна для GigaAM; переход на CPU запрещён")
-        if "+cuda12" not in sherpa_onnx.__version__:
-            raise RuntimeError("Для CAM++ требуется CUDA 12/cuDNN 9 сборка sherpa-onnx")
         self._torch = torch
         self._asr_stream = torch.cuda.Stream(device=0)
         torch.set_num_threads(max(1, self.cfg.asr_threads))
-        self.versions.update({"sherpa-onnx": sherpa_onnx.__version__, "torch": torch.__version__})
+        self.versions["torch"] = torch.__version__
         self.components["asr"].model = "GigaAM-v3 e2e RNNT (PyTorch CUDA, fp16 encoder)"
 
         t = time.perf_counter()
@@ -147,6 +154,12 @@ class CudaEngines(Engines):
         self._set("asr", "ready", "CUDA:0, fp16 encoder / fp32 head", time.perf_counter() - t)
         log.info("GigaAM ASR: загрузка завершена")
         log_gpu_memory("ASR")
+
+        if not speaker_enabled:
+            self._set("spk", "off", "Отключено в режиме первой линии")
+            self._set("emo", "off", "Отключено в режиме первой линии")
+            self._set("llm", "off", "Отключено в режиме первой линии")
+            return
 
         t = time.perf_counter()
         log.info("GigaAM CAM++: начало создания SpeakerEmbeddingExtractor, модель %s, provider=cuda", self.cfg.spk_model)
@@ -217,6 +230,6 @@ class CudaEngines(Engines):
 
     def placement(self) -> dict:
         return {"asr": "PyTorch CUDA:0, fp16 encoder / fp32 head",
-                "speaker": "sherpa-onnx CUDA:0, fp32 CAM++",
-                "emotion": "PyTorch CUDA:0, fp16 encoder / fp32 head",
+                "speaker": "sherpa-onnx CUDA:0, fp32 CAM++" if self._spk is not None else "отключено",
+                "emotion": "PyTorch CUDA:0, fp16 encoder / fp32 head" if self._emo is not None else "отключено",
                 "vad": self._vad_sess.get_providers()}

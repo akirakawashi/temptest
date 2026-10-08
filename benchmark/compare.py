@@ -75,11 +75,30 @@ class Audio:
     samples: int
     sha256_pcm: str
     preparation_seconds: float
+    source_channels: int | None = None
+    source_sample_rate: int | None = None
+    source_bytes: int | None = None
+
+
+def source_audio_info(source: Path) -> tuple[int | None, int | None]:
+    try:
+        if source.suffix.lower() == ".wav":
+            with wave.open(str(source), "rb") as stream:
+                return stream.getnchannels(), stream.getframerate()
+        import av
+
+        with av.open(str(source)) as container:
+            stream = container.streams.audio[0]
+            return stream.codec_context.channels, stream.codec_context.sample_rate
+    except (ImportError, OSError, IndexError, ValueError, wave.Error) as exc:
+        log.warning("Не удалось получить каналы и частоту исходной записи %s: %s", source.name, exc)
+        return None, None
 
 
 def prepare_audio(source: Path, target: Path, *, max_seconds: float | None = None) -> Audio:
     """Единый WAV для обеих систем; преобразование не входит в их таймеры."""
     started = time.perf_counter()
+    source_channels, source_rate = source_audio_info(source)
     command = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(source), "-vn"]
     if max_seconds is not None:
         command.extend(["-t", str(max_seconds)])
@@ -114,7 +133,8 @@ def prepare_audio(source: Path, target: Path, *, max_seconds: float | None = Non
     if samples <= 0 or actual_bytes != samples * 2:
         raise ValueError(f"Пустая или повреждённая запись: {source}")
     return Audio(str(source), str(target), samples / 16000, samples,
-                 digest.hexdigest(), time.perf_counter() - started)
+                 digest.hexdigest(), time.perf_counter() - started,
+                 source_channels, source_rate, source.stat().st_size)
 
 
 def read_audio(audio: Audio):
@@ -155,7 +175,7 @@ def host_info() -> dict:
 
 def csv_row(row: dict) -> dict:
     audio = row["audio"]
-    whisper, giga = row.get("whisper", {}), row.get("gigaam", {})
+    whisper, giga, first = (row.get(s, {}) for s in ("whisper", "gigaam", "gigaam_first_line"))
     duration = audio.seconds
 
     def number(value):
@@ -179,6 +199,11 @@ def csv_row(row: dict) -> dict:
         "GigaAM CAM++, с": number(giga.get("stages", {}).get("speaker", {}).get("seconds")),
         "GigaAM эмоции, с": number(giga.get("stages", {}).get("emotion", {}).get("seconds")),
         "GigaAM LLM, с": number(giga.get("llm_seconds")),
+        "Первая линия полностью, с": number(first.get("elapsed_seconds")),
+        "Первая линия ASR, с": number(first.get("asr_seconds")),
+        "Первая линия VAD, с": number(first.get("stages", {}).get("vad", {}).get("seconds")),
+        "Первая линия — паузы, с": number(first.get("pause_seconds")),
+        "Первая линия — статус": STATUS[first.get("status", "pending")],
         "Whisper / длительность": ratio(whisper, "elapsed_seconds"),
         "GigaAM распознавание / длительность": ratio(giga, "asr_seconds"),
         "GigaAM полностью / длительность": ratio(giga, "elapsed_seconds"),
@@ -186,7 +211,7 @@ def csv_row(row: dict) -> dict:
         "GigaAM — статус": STATUS[giga.get("status", "pending")],
         "LLM — текст сокращён": "да" if (giga.get("analysis") or {}).get("truncated") else "нет" if giga.get("analysis") else "",
         "LLM — загрузка в замере, с": number((giga.get("analysis") or {}).get("load_sec")),
-        "Причина": "; ".join(r["error"] for r in (whisper, giga) if r.get("error")),
+        "Причина": "; ".join(r["error"] for r in (whisper, giga, first) if r.get("error")),
         "Результаты": row["directory"],
     }
 
@@ -276,6 +301,24 @@ def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None
                 "Продовые контейнеры и их API не используются. GPU общая: посторонняя нагрузка и порядок фаз влияют на результат.",
         }
         lines = [replacements.get(line, line) for line in lines]
+    if any("gigaam_first_line" in row["order"] for row in rows):
+        completed = [r for r in rows if all(r.get(s, {}).get("status") == "ok" for s in ("whisper", "gigaam", "gigaam_first_line"))]
+        lines.extend(["", "## GigaAM для первой линии — отдельный измеренный прогон", "",
+                      "Только VAD и ASR; без CAM++, эмоций и GigaChat. Все три режима читают тот же моно WAV.",
+                      "Роли по исходным каналам не восстанавливаются; паузы — оценка VAD.",
+                      f"Полностью успешных троек: {len(completed)} из {len(rows)}.", "",
+                      "| Запись | Первая линия ASR, с | Первая линия полностью, с | Статус |",
+                      "|---|---:|---:|---|"])
+        for row in rows:
+            first = row.get("gigaam_first_line", {})
+            lines.append(f"| {Path(row['audio'].source).name.replace('|', ' ')} | {fmt(first, 'asr_seconds')} | "
+                         f"{fmt(first, 'elapsed_seconds')} | {STATUS[first.get('status', 'pending')]} |")
+        if completed:
+            lines.append("")
+            for system, label in (("whisper", "Whisper"), ("gigaam", "GigaAM полностью"), ("gigaam_first_line", "Первая линия")):
+                seconds = sum(r[system]["elapsed_seconds"] for r in completed)
+                lines.append(f"- {label}: {seconds:.3f} с; среднее {seconds / len(completed):.3f} с; "
+                             f"за 15 минут ≈ {900 * len(completed) / seconds:.1f} записей этого корпуса.")
     (output / "отчёт.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -290,12 +333,15 @@ def save_result(output: Path, row: dict, system: str, result: dict) -> None:
         log.error("%s", result["error"])
     if result.get("response_error"):
         log.error("Whisper — ответ при ошибке:\n%s", result["response_error"])
-    if system == "gigaam":
+    if system in {"gigaam", "gigaam_first_line"}:
         STAGES = {"vad": "Выделение речи", "asr": "Распознавание речи", "speaker": "Разделение собеседников", "emotion": "Определение эмоций"}
 
         for stage, values in result.get("stages", {}).items():
             log.info("GigaAM — %s: %.6f с, вызовов %d, ошибок %d", STAGES[stage], values["seconds"], values["calls"], values["errors"])
-        log.info("GigaAM — разбор LLM: %.6f с", result.get("llm_seconds", 0))
+        log.info("%s — включённые этапы: %s; разбор LLM: %.6f с", system,
+                 result.get("enabled_stages"), result.get("llm_seconds", 0))
+        log.info("%s — распределение времени: %s; счётчики: %s", system, result.get("timing"), result.get("counters"))
+        log.info("%s — интервалы пауз VAD: %s", system, result.get("pauses"))
         for call in result.get("stage_calls", []):
             log.info("GigaAM — вызов модели: %s", json.dumps(call, ensure_ascii=False))
         emotions = {"angry": "раздражение", "sad": "грусть", "neutral": "нейтрально", "positive": "позитив"}
@@ -343,7 +389,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--timeout", type=positive_int, default=3600, help="Максимальное ожидание подготовки и одного прогона, секунды")
     result.add_argument("--warmup-file", type=Path, help="Отдельная запись с речью для прогрева; по умолчанию первая запись корпуса")
     result.add_argument("--warmup-seconds", type=positive_int, default=30)
-    result.add_argument("--phase", choices=["local", "whisper-api", "gigaam", "gigaam-prepare", "gigaam-only"], default="local")
+    result.add_argument("--phase", choices=["local", "whisper-api", "gigaam", "gigaam-prepare", "gigaam-only", "gigaam-first-line"], default="local")
+    result.add_argument("--include-first-line", action="store_true", help="После полного GigaAM измерить VAD+ASR без голосов, эмоций и LLM (серверный стенд)")
     result.add_argument("--expected-files", type=positive_int, default=int(os.environ.get("BENCH_EXPECTED_FILES", "100")))
     result.add_argument("--api-gap", type=float, default=float(os.environ.get("BENCH_API_GAP", "5")))
     result.add_argument("--api-timeout", type=positive_int, default=int(os.environ.get("BENCH_API_TIMEOUT", "1200")))
@@ -357,6 +404,7 @@ async def run_worker(request: dict) -> dict:
     response_path = directory / f"{request['system']}-ответ.json"
     process_log_path = directory / f"{request['system']}-процесс.log"
     write_json(request_path, request)
+    worker_started = time.perf_counter()
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-X", "faulthandler", "-m", "benchmark.worker", str(request_path),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -401,7 +449,9 @@ async def run_worker(request: dict) -> dict:
                            "error": f"Процесс {request['system']} завершился с {detail}; стек и журнал: {process_log_path}"},
                 "preparation": preparation}
     payload = json.loads(response_path.read_text(encoding="utf-8"))
-    request_path.unlink(missing_ok=True)
+    payload["preparation"]["worker_wall_seconds"] = time.perf_counter() - worker_started
+    payload["preparation"]["process_exit_code"] = process.returncode
+    write_json(directory / f"{request['system']}-подготовка.json", payload["preparation"])
     response_path.unlink(missing_ok=True)
     return payload
 

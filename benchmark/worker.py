@@ -4,9 +4,11 @@ from __future__ import annotations
 import asyncio
 import faulthandler
 from dataclasses import asdict
+from datetime import datetime
 import json
 import logging
 import os
+import resource
 from pathlib import Path
 import sys
 import time
@@ -21,15 +23,19 @@ async def execute(request: dict) -> dict:
         os.environ[name] = str(request["threads"])
     from app.config import Settings
     from benchmark.gpu import gpu_info, require_idle_ollama
-    from benchmark.pipeline import GigaPipeline, WhisperPipeline, versions
+    from benchmark.pipeline import FirstLinePipeline, GigaPipeline, WhisperPipeline, versions
 
     system = request["system"]
+    first_line = system == "gigaam_first_line"
     output = Path(request["output"])
     runner = None
     llm_prepared = False
     result = None
     measurement_started = None
-    preparation = {"system": system, "included_in_measurements": False}
+    preparation = {"system": system, "included_in_measurements": False, "pid": os.getpid(),
+                   "started_at": datetime.now().astimezone().isoformat(),
+                   "audio": request["audio"], "warmup_audio": request["warmup"],
+                   "enabled_stages": ["vad", "asr"] if first_line else None}
     try:
         log.info("%s: проверка GPU, PID %d", system, os.getpid())
         preparation["gpu"] = gpu_info()
@@ -49,14 +55,19 @@ async def execute(request: dict) -> dict:
             preparation["placement"] = {"asr": "CTranslate2 CUDA:0, float16", "vad": runner.vad_providers}
         else:
             cfg = Settings(asr_threads=request["threads"], spk_threads=request["threads"],
-                           emo_threads=request["threads"], emo_enabled=True, llm_enabled=True, llm_keep_alive=-1)
+                           emo_threads=request["threads"], emo_enabled=not first_line,
+                           llm_enabled=not first_line, llm_keep_alive=-1)
+            if first_line:
+                cfg.split_turns = False
             cfg.llm_autopull = False
-            runner = GigaPipeline(cfg, request["threads"], request["timeout"])
+            runner_type = FirstLinePipeline if first_line else GigaPipeline
+            runner = runner_type(cfg, request["threads"], request["timeout"])
             preparation["settings"] = asdict(cfg)
             preparation["llm_runtime"] = runner.llm_runtime
-            await require_idle_ollama(cfg.ollama_url, request["timeout"])
+            if not first_line:
+                await require_idle_ollama(cfg.ollama_url, request["timeout"])
             await asyncio.wait_for(runner.load(), request["timeout"])
-            llm_prepared = True
+            llm_prepared = not first_line
             preparation["placement"] = runner.engines.placement()
         preparation["load_seconds"] = time.perf_counter() - started
         preparation["phase"] = "Перед прогревом"
@@ -72,25 +83,31 @@ async def execute(request: dict) -> dict:
             raise RuntimeError(f"Прогрев {system} не завершён: {warm_result.get('error') or STATUS[warm_result['status']]}.{advice}")
         preparation["warmup_seconds"] = warm_result["elapsed_seconds"]
         log.info("%s: прогрев завершён за %.3f с", system, preparation["warmup_seconds"])
-        if system == "gigaam":
+        if system != "whisper":
             from benchmark.gpu import log_gpu_memory
 
-            log_gpu_memory("прогрева полного GigaAM")
-            preparation["ollama_loaded_models"] = await runner.gpu_model_info()
-            log.info("GigaAM: ASR, голоса, эмоции и VAD — CUDA; LLM — 100% GPU")
+            preparation["gpu_after_warmup"] = log_gpu_memory("прогрева GigaAM первой линии" if first_line else "прогрева полного GigaAM")
+            if not first_line:
+                preparation["ollama_loaded_models"] = await runner.gpu_model_info()
+                log.info("GigaAM: ASR, голоса, эмоции и VAD — CUDA; LLM — 100% GPU")
         else:
             log.info("Whisper: распознавание и VAD — CUDA")
-        preparation["versions"] = {**versions(), **(runner.engines.versions if system == "gigaam" else {})}
+        preparation["versions"] = {**versions(), **(runner.engines.versions if system != "whisper" else {})}
         preparation["phase"] = "Перед замером"
         write_json(output / f"{system}-подготовка.json", preparation)
         log.info("%s — начало измеряемой обработки", system)
+        preparation["measurement_started_at"] = datetime.now().astimezone().isoformat()
         measurement_started = time.perf_counter()
         if system == "whisper":
             result = await asyncio.wait_for(asyncio.to_thread(runner.run, samples), request["timeout"])
         else:
             result = await runner.run(samples)
-            if result["status"] == "ok":
+            preparation["measurement_finished_at"] = datetime.now().astimezone().isoformat()
+            if result["status"] == "ok" and not first_line:
                 result["ollama_loaded_models"] = await runner.gpu_model_info()
+            from benchmark.gpu import log_gpu_memory
+
+            preparation["gpu_after_measurement"] = log_gpu_memory("замера первой линии" if first_line else "замера полного GigaAM")
     except Exception as exc:
         log.exception("Ошибка %s: %s", system, exc)
         if result is None:
@@ -110,6 +127,10 @@ async def execute(request: dict) -> dict:
                     log.exception("Не удалось освободить GPU от LLM: %s", exc)
                     if result is not None:
                         result.update(status="error", error=f"Не удалось выгрузить LLM: {exc}")
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        preparation["finished_at"] = datetime.now().astimezone().isoformat()
+        preparation["process_usage"] = {"peak_rss_mib": usage.ru_maxrss / 1024,
+                                        "cpu_user_seconds": usage.ru_utime, "cpu_system_seconds": usage.ru_stime}
         write_json(output / f"{system}-подготовка.json", preparation)
     return {"result": result, "preparation": preparation}
 

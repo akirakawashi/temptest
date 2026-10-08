@@ -69,6 +69,7 @@ def test_preparation_without_ffmpeg_creates_shared_pcm_with_safe_clipping(tmp_pa
     monkeypatch.setattr(compare.shutil, "which", lambda name: None)
     decoded = np.array([-1.0, 0.0, 0.5, 1.0, -0.25], dtype=np.float32)
     monkeypatch.setitem(sys.modules, "faster_whisper.audio", SimpleNamespace(decode_audio=lambda *args, **kwargs: decoded))
+    (tmp_path / "запись.mp3").write_bytes(b"fake-audio")
     audio = compare.prepare_audio(tmp_path / "запись.mp3", tmp_path / "общий.wav", max_seconds=4 / 16000)
     result = compare.read_audio(audio)
     assert audio.samples == 4 and len(audio.sha256_pcm) == 64
