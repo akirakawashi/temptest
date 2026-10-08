@@ -16,6 +16,7 @@ from app.config import SAMPLE_RATE, Settings
 from benchmark.gpu import CudaEngines, configure_whisper_vad
 from app.llm import LLM
 from app.session import Session
+from benchmark.llm_settings import llm_runtime
 
 log = logging.getLogger("сравнение")
 
@@ -161,6 +162,7 @@ class WhisperPipeline:
 class GigaPipeline:
     def __init__(self, cfg: Settings, threads: int, timeout: float, seed: int = 42):
         self.cfg, self.threads, self.timeout, self.seed = cfg, threads, timeout, seed
+        self.llm_runtime = llm_runtime(threads, cfg, seed)
         self.engines = TimedEngines(cfg)
         self.llm = LLM(cfg, self.engines)
         self.events: list[dict] = []
@@ -176,6 +178,9 @@ class GigaPipeline:
             raise RuntimeError(f"Не загрузилась модель эмоций: {self.engines.status()['emo']['detail']}")
         # prepare() может ждать сервер бесконечно; у стенда ожидание ограничено.
         log.info("GigaAM LLM: начало подготовки Ollama, модель %s", self.cfg.llm_model)
+        log.info("GigaAM LLM: контекст %d, батч %d, запрошен KV-кеш %s и полная загрузка на GPU",
+                 self.llm_runtime["options"]["num_ctx"], self.llm_runtime["options"]["num_batch"],
+                 self.llm_runtime["kv_cache_type_requested"])
         if self.cfg.llm_autopull:
             await asyncio.wait_for(self.llm.prepare(), timeout=self.timeout)
         elif not await asyncio.wait_for(self.llm._prepare_once(), timeout=self.timeout):
@@ -222,7 +227,7 @@ class GigaPipeline:
                     try:
                         await self.llm.analyze(
                             session.transcript(), emit,
-                            options={"num_thread": self.threads, "num_gpu": 999, "seed": self.seed},
+                            options=self.llm_runtime["options"],
                         )
                     finally:
                         llm_seconds = time.perf_counter() - llm_started

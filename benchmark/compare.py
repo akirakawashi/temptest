@@ -407,6 +407,8 @@ async def run_worker(request: dict) -> dict:
 
 
 async def run(args) -> int:
+    from benchmark.llm_settings import llm_runtime
+
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[name] = str(args.threads)
 
@@ -424,7 +426,8 @@ async def run(args) -> int:
         "whisper": {"engine": "faster-whisper", "model": args.whisper_model, "compute_type": "float16",
                     "beam_size": args.beam_size, "vad_filter": True, "word_timestamps": True},
         "gigaam": {"asr_model": "v3_e2e_rnnt", "asr_backend": "официальный PyTorch CUDA",
-                   "llm_options": {"num_thread": args.threads, "num_gpu": 999, "seed": 42},
+                   "llm_options": llm_runtime(args.threads)["options"],
+                   "llm_runtime": llm_runtime(args.threads),
                    "ollama_flash_attention": True, "ollama_parallel": 1},
         "isolation": "Отдельный процесс на систему и запись; другая система и её LLM выгружены",
         "preparations": [],

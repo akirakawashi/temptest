@@ -103,6 +103,12 @@ def render(output: Path, rows: list, conditions: dict):
               'Записи можно сопоставить с прежними результатами по имени и SHA256 PCM.' if gigaam_only else
               'Whisper: HTTP-запрос включает передачу аудио, очередь и ответ. GigaAM: локальный конвейер после прогрева. '
               'Тестовый Whisper останавливается перед GigaAM.')
+    runtime = conditions.get("gigaam", {}).get("llm_runtime", {})
+    options = runtime.get("options", {})
+    llm_note = (f'<p>Контекст LLM: {options.get("num_ctx")}; батч: {options.get("num_batch")}; '
+                f'KV-кеш (задано): {escape(str(runtime.get("kv_cache_type_requested")))}. '
+                'Настройки LLM влияют на время полного цикла и результат текстового разбора.</p>'
+                if runtime else '')
     html = ('<!doctype html><html lang="ru"><meta charset="utf-8"><title>Результаты систем речи</title>'
             '<style>body{font-family:sans-serif;margin:24px;color:#17233a}svg{max-width:100%;height:auto}.chart{overflow:auto}p{max-width:1000px}</style>'
             f'<h1>{heading}</h1><p>Состояние: {escape(conditions["state"])}. '
@@ -111,6 +117,7 @@ def render(output: Path, rows: list, conditions: dict):
             'Скорость не является оценкой точности.</p>'
             '<p>GPU общая с рабочими сервисами. Их нагрузка влияет на время обеих фаз; '
             'график GPU показывает суммарную загрузку всех процессов.</p>'
+            + llm_note
             + ''.join(f'<div class="chart">{svg}</div>' for svg in charts.values()) + '</html>')
     (output / "отчёт.html").write_text(html, encoding="utf-8")
 

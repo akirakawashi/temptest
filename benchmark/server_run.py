@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 
 from benchmark import compare
+from benchmark.llm_settings import llm_runtime
 from benchmark.whisper_api import TEST_URL, WhisperAPI
 
 log = logging.getLogger("серверный-прогон")
@@ -52,7 +53,8 @@ async def whisper_phase(args) -> int:
                   "timers": {"whisper": "Полный HTTP-запрос после прогрева, загрузка и прогрев исключены",
                              "gigaam": "Полный локальный цикл и отдельно сумма ASR; загрузка и прогрев исключены"},
                   "gigaam": {"model_load_per_record": True, "warmup_per_record": True,
-                             "preparation_included_in_measurements": False},
+                             "preparation_included_in_measurements": False,
+                             "llm_runtime": llm_runtime(args.threads)},
                   "production_service_management": False, "production_requests": False,
                   "containers_retained": True,
                   "whisper_external_network": False, "gigaam_external_network": False}
@@ -152,7 +154,8 @@ async def gigaam_prepare_phase(args) -> int:
                   "input": "mono_16000_pcm_s16le", "concurrency": 1,
                   "timers": {"gigaam": "Полный локальный цикл и отдельно сумма ASR; подготовка, загрузка и прогрев исключены"},
                   "gigaam": {"model_load_per_record": True, "warmup_per_record": True,
-                             "preparation_included_in_measurements": False},
+                             "preparation_included_in_measurements": False,
+                             "llm_runtime": llm_runtime(args.threads)},
                   "guard_policy": {key: os.environ.get(key) for key in
                                    ("BENCH_GPU_MIN_FREE_MIB", "BENCH_GPU_MAX_UTIL", "BENCH_GPU_RESERVE_MIB", "BENCH_MIN_RAM_MIB")},
                   "production_service_management": False, "production_requests": False,
@@ -191,6 +194,7 @@ async def gigaam_prepare_phase(args) -> int:
 
 
 async def run_gigaam(args, rows: list, conditions: dict) -> int:
+    conditions["gigaam"]["llm_runtime"] = llm_runtime(args.threads)
     conditions["state"] = "GigaAM выполняется"
     update(args.out, rows, conditions)
     try:

@@ -20,6 +20,7 @@ from app.llm import LLM
 from app.session import Session
 from app.vad import StreamingVad, make_onnx_session
 from benchmark import compare, pipeline, worker
+from benchmark.llm_settings import llm_runtime
 
 
 @dataclass
@@ -174,13 +175,16 @@ def test_session_waits_for_emotion_model_and_event_delivery():
 class FakeLLM:
     def __init__(self, event=None):
         self.called = 0
+        self.options = []
         self.event = event or {"type": "llm", "state": "done", "completed": True,
                                "result": {"summary": "Тестовый разговор"}}
 
     async def analyze(self, transcript, emit, **kwargs):
         self.called += 1
         assert "нейтрально" in transcript  # эмоция готова до запроса LLM
-        assert kwargs["options"] == {"num_thread": 2, "num_gpu": 999, "seed": 42}
+        assert kwargs["options"] == {"num_thread": 2, "num_gpu": 999, "seed": 42,
+                                     "num_ctx": 8192, "num_batch": 64}
+        self.options.append(kwargs["options"])
         await emit(self.event)
 
 
@@ -207,6 +211,7 @@ def test_full_giga_waits_for_emotions_and_resets_speakers_per_file():
                 assert result["stages"]["asr"]["calls"] == 1
                 assert result["analysis"]["result"]
             assert giga.llm.called == 2
+            assert all(options["num_batch"] == 64 and options["num_ctx"] == 8192 for options in giga.llm.options)
         finally:
             giga.shutdown()
 
@@ -289,7 +294,10 @@ def test_bad_llm_response_is_a_failed_full_cycle(event):
     asyncio.run(scenario())
 
 
-def test_llm_request_has_cpu_thread_limit_and_keeps_original_options(monkeypatch):
+@pytest.mark.parametrize("batch", [64, 128])
+def test_llm_request_has_cpu_thread_limit_and_keeps_original_options(monkeypatch, batch):
+    monkeypatch.setenv("BENCH_LLM_NUM_BATCH", str(batch))
+    monkeypatch.setenv("BENCH_LLM_KV_CACHE_TYPE", "q8_0")
     bodies = []
 
     class Response:
@@ -328,15 +336,31 @@ def test_llm_request_has_cpu_thread_limit_and_keeps_original_options(monkeypatch
         async def emit(event):
             events.append(event)
 
-        await model.analyze("Тест", emit, options={"num_thread": 2, "num_gpu": 999, "seed": 42})
+        await model.analyze("Тест", emit, options=llm_runtime(2, model.cfg)["options"])
         assert bodies[0]["options"]["num_thread"] == 2
         assert bodies[0]["options"]["num_gpu"] == 999
+        assert bodies[0]["options"]["num_ctx"] == 8192
+        assert bodies[0]["options"]["num_batch"] == batch
         assert bodies[0]["options"]["temperature"] == 0.2
         assert bodies[0]["keep_alive"] == -1
         assert isinstance(bodies[0]["keep_alive"], int)
         assert events[-1]["completed"] is True
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("variable,value", [
+    ("BENCH_LLM_NUM_BATCH", "0"), ("BENCH_LLM_NUM_BATCH", "-1"),
+    ("BENCH_LLM_NUM_BATCH", "1.5"), ("BENCH_LLM_NUM_BATCH", "2048"),
+    ("BENCH_LLM_KV_CACHE_TYPE", "invalid"),
+])
+def test_invalid_llm_memory_settings_fail_before_creating_engines(monkeypatch, variable, value):
+    monkeypatch.setenv(variable, value)
+    def forbidden(*args):
+        raise AssertionError("Модели и рабочие пулы не должны создаваться")
+    monkeypatch.setattr(pipeline, "TimedEngines", forbidden)
+    with pytest.raises(ValueError, match=variable):
+        pipeline.GigaPipeline(Settings(), 2, 5)
 
 
 def write_wav(path, level):
@@ -379,6 +403,7 @@ def install_fake_runners(monkeypatch, *, fail_whisper=False, warm_giga_status="o
     class Giga:
         def __init__(self, *args):
             self.engines = SimpleNamespace(versions={}, placement=lambda: {"asr": "Тестовая CUDA"})
+            self.llm_runtime = llm_runtime(args[1], args[0])
             self.count = 0
 
         async def load(self):

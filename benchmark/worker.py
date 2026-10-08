@@ -53,6 +53,7 @@ async def execute(request: dict) -> dict:
             cfg.llm_autopull = False
             runner = GigaPipeline(cfg, request["threads"], request["timeout"])
             preparation["settings"] = asdict(cfg)
+            preparation["llm_runtime"] = runner.llm_runtime
             await require_idle_ollama(cfg.ollama_url, request["timeout"])
             await asyncio.wait_for(runner.load(), request["timeout"])
             llm_prepared = True

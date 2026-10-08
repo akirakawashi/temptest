@@ -189,6 +189,8 @@ def test_gigaam_only_prepares_new_corpus_without_whisper_and_preserves_previous_
     import wave
     from benchmark import pipeline
 
+    monkeypatch.setenv("BENCH_LLM_NUM_BATCH", "64")
+    monkeypatch.setenv("BENCH_LLM_KV_CACHE_TYPE", "q8_0")
     source, output = tmp_path / "input", tmp_path / "new-results"
     source.mkdir()
     write_wav(source / "1.wav", 100)
@@ -226,6 +228,9 @@ def test_gigaam_only_prepares_new_corpus_without_whisper_and_preserves_previous_
     assert not list(output.rglob("whisper.json"))
     conditions = json.loads((output / "условия.json").read_text())
     assert conditions["mode"] == "gigaam_only" and conditions["whisper"]["enabled"] is False
+    runtime = conditions["gigaam"]["llm_runtime"]
+    assert runtime["options"]["num_ctx"] == 8192 and runtime["options"]["num_batch"] == 64
+    assert runtime["options"]["num_gpu"] == 999 and runtime["kv_cache_type_requested"] == "q8_0"
     if failure:
         assert not calls
         assert conditions["state"].startswith("Остановлен")
@@ -239,6 +244,8 @@ def test_gigaam_only_prepares_new_corpus_without_whisper_and_preserves_previous_
         assert "1.400 с" in (output / "графики" / "итоги.svg").read_text()
         assert "3.000 с" in (output / "графики" / "этапы-gigaam.svg").read_text()
         assert "успешных результатов GigaAM: 2" in (output / "отчёт.html").read_text()
+        assert "Контекст LLM: 8192; батч: 64; KV-кеш (задано): q8_0" in (output / "отчёт.html").read_text()
+        assert all(item["llm_runtime"] == runtime for item in conditions["preparations"])
         with pytest.raises(ValueError, match="повторного запуска"):
             compare.main(args)
         args[1] = "gigaam-prepare"
@@ -489,8 +496,8 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         assert "Завершение: код 0" in result.stdout
 
 
-@pytest.mark.parametrize("download_network", ["host", "bridge"])
-def test_download_network_never_reaches_audio_processing_containers(tmp_path, download_network):
+@pytest.mark.parametrize("download_network,batch,cache", [("host", "64", "q8_0"), ("bridge", "128", "f16")])
+def test_download_network_never_reaches_audio_processing_containers(tmp_path, download_network, batch, cache):
     """Только разбор Compose: без демона Docker, контейнеров и скачивания моделей."""
     docker = shutil.which("docker")
     if docker is None:
@@ -499,6 +506,7 @@ def test_download_network_never_reaches_audio_processing_containers(tmp_path, do
     env = {**os.environ, "BENCH_AUDIO_DIR": str(tmp_path / "audio"), "BENCH_OUT": str(tmp_path / "results"),
            "BENCH_CACHE": str(tmp_path / "cache"), "BENCH_DOWNLOAD_NETWORK": download_network,
            "BENCH_BUILD_NETWORK": "default", "BENCH_OLLAMA_DOWNLOAD_PORT": "11435",
+           "BENCH_LLM_NUM_BATCH": batch, "BENCH_LLM_KV_CACHE_TYPE": cache, "LLM_NUM_CTX": "8192",
            "HF_TOKEN": "", "WHISPER_API_BASE_URL": "http://production.example/v1", "WHISPER_API_KEY": "prod-secret"}
     parsed = subprocess.run([docker, "compose", "--env-file", "/dev/null", "--project-name", "speech-comparison",
                              "--project-directory", str(project), "-f", str(project / "compose.benchmark.yml"),
@@ -521,6 +529,13 @@ def test_download_network_never_reaches_audio_processing_containers(tmp_path, do
     assert client["WHISPER_API_BASE_URL"] == TEST_URL and "WHISPER_API_KEY" not in client
     assert services["ollama-download"]["environment"]["OLLAMA_HOST"] == "127.0.0.1:11435"
     assert services["ollama-download"]["healthcheck"]["test"] == ["CMD", "ollama", "list"]
+    for name in ("audio-prepare", "whisper-client", "compare"):
+        assert services[name]["environment"]["BENCH_LLM_NUM_BATCH"] == batch
+        assert services[name]["environment"]["BENCH_LLM_KV_CACHE_TYPE"] == cache
+        assert services[name]["environment"]["LLM_NUM_CTX"] == "8192"
+    assert services["ollama"]["environment"]["OLLAMA_KV_CACHE_TYPE"] == cache
+    assert services["ollama"]["environment"]["OLLAMA_FLASH_ATTENTION"] == "1"
+    assert "OLLAMA_KV_CACHE_TYPE" not in services["ollama-download"]["environment"]
 
 
 @pytest.mark.parametrize("url", ["http://10.220.21.2:8002/v1", "http://localhost:9000/v1", "https://api.openai.com/v1"])
