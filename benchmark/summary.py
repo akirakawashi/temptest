@@ -67,13 +67,21 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
         mean = entry["processing_seconds"].get("mean")
         entry["records_per_15_minutes"] = 900 / mean if mean and mean > 0 else None
         for stage in ("vad", "asr", "speaker", "emotion", "llm"):
-            values = [r[system].get("llm_seconds", 0) if stage == "llm" else r[system].get("stages", {}).get(stage, {}).get("seconds", 0) for r in good]
+            enabled = stage in {"vad", "asr"} or system == "gigaam"
+            stage_rows = [r[system] for r in good if enabled and ((stage == "llm" and "llm_seconds" in r[system])
+                          or (stage != "llm" and stage in r[system].get("stages", {})))]
+            values = [result["llm_seconds"] if stage == "llm" else result["stages"][stage]["seconds"] for result in stage_rows]
+            all_stage_rows = [r.get(system, {}) for r in rows if enabled and ((stage == "llm" and "llm_seconds" in r.get(system, {}))
+                              or (stage != "llm" and stage in r.get(system, {}).get("stages", {})))]
+            llm_calls = [call for result in all_stage_rows for call in result.get("stage_calls", []) if call["stage"] == "llm"]
             entry["stages"][stage] = {"seconds": distribution(values),
-                "calls": sum(r[system].get("stages", {}).get(stage, {}).get("calls", 0) for r in good),
-                "errors": sum(r.get(system, {}).get("stages", {}).get(stage, {}).get("errors", 0) for r in rows),
-                "enabled": system != "whisper" and (system != "gigaam_first_line" or stage in {"vad", "asr"})}
+                "calls": (len(llm_calls) if stage == "llm" else
+                          sum(result["stages"][stage]["calls"] for result in all_stage_rows)) if all_stage_rows else None,
+                "errors": (sum(bool(call.get("error")) for call in llm_calls) if stage == "llm" else
+                           sum(result["stages"][stage]["errors"] for result in all_stage_rows)) if all_stage_rows else None,
+                "enabled": enabled, "measured": bool(stage_rows)}
             total_processing = entry["processing_seconds"].get("total", 0)
-            entry["stages"][stage]["operation_time_vs_total_percent"] = sum(values) / total_processing * 100 if total_processing else None
+            entry["stages"][stage]["operation_time_vs_total_percent"] = sum(values) / total_processing * 100 if values and total_processing else None
         timed = [r[system]["timing"] for r in good if "timing" in r[system]]
         if timed:
             keys = timed[0]["exclusive_wall_seconds"]

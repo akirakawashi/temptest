@@ -401,8 +401,8 @@ def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_pa
         assert "Завершение: код 129" in logs[0].read_text()
 
 
-@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console", [
-    (*case, False, False) for case in [
+@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console, gigaam_exit, first_line_exit", [
+    (*case, False, False, 0, 0) for case in [
     (14600, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0, 0, 0),
     (90000, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (14600, 100, 12288, 10, 0, 0, 0, 0, 0, 0),
     (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0), (3000, 100, 12288, 100, 0, 0, 0, 0, 0, 0),
@@ -411,10 +411,12 @@ def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_pa
     (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 52),
     ]
 ] + [
-    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, True, False, id="completed-whisper-log-reader-ignores-sigterm"),
-    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, True, id="blocked-console-does-not-stop-gigaam"),
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, True, False, 0, 0, id="completed-whisper-log-reader-ignores-sigterm"),
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, True, 0, 0, id="blocked-console-does-not-stop-gigaam"),
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, False, 47, 0, id="full-gigaam-error-blocks-first-line"),
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, False, 0, 48, id="first-line-error-is-failed-launch"),
 ])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console):
+def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console, gigaam_exit, first_line_exit):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -432,6 +434,8 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
                       'if a[0] == "compose" and "up" in a and a[-1] == "ollama-download": sys.exit(int(os.environ["OLLAMA_DOWNLOAD_START_EXIT"]))\n'
                       'if a[0] == "compose" and "run" in a: assert sys.stdin.buffer.read(1) == b""\n'
                       'if a[0] == "wait":\n'
+                      ' if "-gigaam-" in a[-1]: print(os.environ["GIGAAM_EXIT"]); sys.exit(0)\n'
+                      ' if "-first-line-" in a[-1]: print(os.environ["FIRST_LINE_EXIT"]); sys.exit(0)\n'
                       ' if "-client-" in a[-1] and (os.environ["IGNORE_LOG_TERM"] == "1" or os.environ["BLOCKED_CONSOLE"] == "1"):\n'
                       '  while not Path(os.environ["LOG_READER_READY"]).exists(): time.sleep(0.01)\n'
                       ' print(os.environ["WHISPER_DOWNLOAD_EXIT"] if "-whisper-download-" in a[-1] else os.environ["API_EXIT"] if "-client-" in a[-1] else "0"); sys.exit(0)\n'
@@ -459,6 +463,7 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
            "BENCH_BUILD_NETWORK": "default",
            "BENCH_DOWNLOAD_NETWORK": "host", "BENCH_OLLAMA_DOWNLOAD_PORT": "11435",
            "API_EXIT": str(api_exit), "CLIENT_BUILD_EXIT": str(client_build_exit),
+           "GIGAAM_EXIT": str(gigaam_exit), "FIRST_LINE_EXIT": str(first_line_exit),
            "WHISPER_START_EXIT": str(whisper_start_exit), "WHISPER_STOP_EXIT": str(whisper_stop_exit),
            "WHISPER_DOWNLOAD_EXIT": str(whisper_download_exit), "OLLAMA_DOWNLOAD_START_EXIT": str(ollama_download_start_exit),
            "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
@@ -485,7 +490,7 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
         launch_log = next((folder / "benchmark-results").glob("*/логи/запуск.log"))
         result = subprocess.CompletedProcess(process.args, returncode, stdout=launch_log.read_text(), stderr="")
     precheck_failed = free < min_free or util > max_util
-    assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)) or ollama_download_start_exit)
+    assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)) or ollama_download_start_exit or gigaam_exit or first_line_exit)
     commands = command_log.read_text()
     builds = [command for line in commands.splitlines()
               if (command := ast.literal_eval(line))[0] == "compose" and "build" in command]
@@ -515,11 +520,15 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
             assert "'stop', 'ollama'" in commands
             waits = [ast.literal_eval(line) for line in commands.splitlines()
                      if ast.literal_eval(line)[0] == "wait"]
-            assert len(waits) == 5
+            assert len(waits) == (4 if gigaam_exit else 5)
+            prefixes = ("speech-comparison-whisper-download-", "speech-comparison-client-",
+                        "speech-comparison-prefetch-", "speech-comparison-gigaam-", "speech-comparison-first-line-")
             assert all(task[1].startswith(prefix) for task, prefix in zip(waits, (
-                "speech-comparison-whisper-download-", "speech-comparison-client-",
-                "speech-comparison-prefetch-", "speech-comparison-gigaam-", "speech-comparison-first-line-"), strict=True))
-            assert commands.index("'stop', 'ollama'") < commands.index("gigaam-first-line")
+                prefixes[:len(waits)]), strict=True))
+            if gigaam_exit:
+                assert "gigaam-first-line" not in commands
+            else:
+                assert commands.index("'stop', 'ollama'") < commands.index("gigaam-first-line")
     if whisper_download_exit:
         assert "whisper-api" not in commands and "'up', '-d', '--wait', '--wait-timeout', '600', 'whisper-bench'" not in commands
         download_logs = list((folder / "benchmark-results").glob("*/логи/загрузка-whisper.log"))
@@ -563,6 +572,7 @@ def test_download_network_never_reaches_audio_processing_containers(tmp_path, do
         pytest.skip("Для разбора Compose нужен CLI Docker")
     project = Path(__file__).resolve().parents[1]
     env = {**os.environ, "BENCH_AUDIO_DIR": str(tmp_path / "audio"), "BENCH_OUT": str(tmp_path / "results"),
+           "BENCH_EXPECTED_FILES": "2",
            "BENCH_CACHE": str(tmp_path / "cache"), "BENCH_DOWNLOAD_NETWORK": download_network,
            "BENCH_BUILD_NETWORK": "default", "BENCH_OLLAMA_DOWNLOAD_PORT": "11435",
            "BENCH_LLM_NUM_BATCH": batch, "BENCH_LLM_KV_CACHE_TYPE": cache, "LLM_NUM_CTX": "8192",
@@ -592,6 +602,8 @@ def test_download_network_never_reaches_audio_processing_containers(tmp_path, do
         assert services[name]["environment"]["BENCH_LLM_NUM_BATCH"] == batch
         assert services[name]["environment"]["BENCH_LLM_KV_CACHE_TYPE"] == cache
         assert services[name]["environment"]["LLM_NUM_CTX"] == "8192"
+    for name in ("audio-prepare", "whisper-client", "compare", "first-line"):
+        assert services[name]["environment"]["BENCH_EXPECTED_FILES"] == "2"
     assert services["ollama"]["environment"]["OLLAMA_KV_CACHE_TYPE"] == cache
     assert services["ollama"]["environment"]["OLLAMA_FLASH_ATTENTION"] == "1"
     assert "OLLAMA_KV_CACHE_TYPE" not in services["ollama-download"]["environment"]

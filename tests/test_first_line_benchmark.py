@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from app.config import Settings
-from benchmark import artifacts, compare, pipeline, server_run, worker
+from benchmark import artifacts, compare, pipeline, server_run, summary, worker
 from test_benchmark import FakeEngines, ScriptedVad, speech, write_wav
 from app.vad import StreamingVad
 
@@ -102,6 +102,32 @@ def test_wall_percentages_count_concurrency_once():
     assert seconds["vad"] == seconds["asr"] == seconds["parallel"] == seconds["llm"] == seconds["other"] == 1
     assert sum(seconds.values()) == 5
     assert sum(result["exclusive_wall_percent"].values()) == pytest.approx(100)
+
+
+def test_summary_distinguishes_unmeasured_whisper_stages_and_disabled_models(tmp_path):
+    row = {"directory": "записи/0001", "audio": compare.Audio("test.wav", "prepared.wav", 10, 160000, "test", .1),
+           "whisper": {"status": "ok", "elapsed_seconds": 1},
+           "gigaam": {"status": "error", "elapsed_seconds": 5, "llm_seconds": 1,
+                      "stage_calls": [{"stage": "llm", "seconds": 1, "error": True}]}}
+    conditions = {"state": "Остановлен из-за ошибки", "planned_systems": list(summary.SYSTEMS)}
+    result = summary.write_summary(tmp_path, [row], conditions)
+    for stage in ("asr", "vad"):
+        whisper = result["systems"]["whisper"]["stages"][stage]
+        assert whisper["enabled"] is True and whisper["measured"] is False
+        assert whisper["seconds"] == {"count": 0}
+        assert whisper["calls"] is None and whisper["operation_time_vs_total_percent"] is None
+    llm = result["systems"]["gigaam"]["stages"]["llm"]
+    assert llm["calls"] == llm["errors"] == 1
+    assert result["matched_comparison"]["records"] == 0
+    row["gigaam_first_line"] = {"status": "ok", "elapsed_seconds": 2, "asr_seconds": 1, "llm_seconds": 0,
+        "stages": {k: {"seconds": 1 if k in {"asr", "vad"} else 0,
+                        "calls": 1 if k in {"asr", "vad"} else 0, "errors": 0} for k in pipeline.STAGES}}
+    result = summary.write_summary(tmp_path, [row], conditions)
+    first = result["systems"]["gigaam_first_line"]["stages"]
+    assert first["asr"]["measured"] is True
+    for stage in ("speaker", "emotion", "llm"):
+        assert first[stage]["enabled"] is False and first[stage]["measured"] is False
+        assert first[stage]["seconds"] == {"count": 0}
 
 
 def test_first_line_worker_never_contacts_ollama(tmp_path, monkeypatch):
