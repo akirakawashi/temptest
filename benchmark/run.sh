@@ -11,14 +11,25 @@ BENCH_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 export BENCH_AUDIO_DIR="$(cd -- "$1" && pwd -P)"
 shift
 BENCH_GIGAAM_ONLY=0
+BENCH_RESUME_FROM=''
 BENCH_FORWARDED_ARGS=()
-for bench_arg in "$@"; do
-    if [[ "$bench_arg" == '--gigaam-only' ]]; then
-        BENCH_GIGAAM_ONLY=1
-    else
-        BENCH_FORWARDED_ARGS+=("$bench_arg")
-    fi
+while (( $# )); do
+    case "$1" in
+        --gigaam-only) BENCH_GIGAAM_ONLY=1; shift ;;
+        --resume-gigaam)
+            [[ $# -ge 2 && -z "$BENCH_RESUME_FROM" && -d "$2" ]] || {
+                echo '--resume-gigaam требует существующую папку предыдущего прогона' >&2; exit 2;
+            }
+            BENCH_RESUME_FROM="$(cd -- "$2" && pwd -P)"
+            shift 2 ;;
+        *) BENCH_FORWARDED_ARGS+=("$1"); shift ;;
+    esac
 done
+[[ -z "$BENCH_RESUME_FROM" || "$BENCH_GIGAAM_ONLY" == 0 ]] || {
+    echo '--resume-gigaam и --gigaam-only нельзя использовать вместе' >&2; exit 2;
+}
+BENCH_SKIP_WHISPER=$BENCH_GIGAAM_ONLY
+[[ -z "$BENCH_RESUME_FROM" ]] || BENCH_SKIP_WHISPER=1
 set -- "${BENCH_FORWARDED_ARGS[@]}"
 exec 9>"$BENCH_PROJECT_DIR/.benchmark.lock"
 flock -n 9 || { echo 'Другой прогон этого стенда уже выполняется' >&2; exit 2; }
@@ -64,6 +75,11 @@ BENCH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p -- "$BENCH_OUT" "$BENCH_CACHE"
 export BENCH_OUT="$(cd -- "$BENCH_OUT" && pwd -P)"
 export BENCH_CACHE="$(cd -- "$BENCH_CACHE" && pwd -P)"
+if [[ -n "$BENCH_RESUME_FROM" ]]; then
+    [[ "$(dirname -- "$BENCH_RESUME_FROM")" == "$BENCH_OUT" && -f "$BENCH_RESUME_FROM/условия.json" ]] || {
+        echo 'Папка --resume-gigaam должна находиться непосредственно в BENCH_OUT и содержать условия.json' >&2; exit 2;
+    }
+fi
 case "$BENCH_OUT/" in "$BENCH_AUDIO_DIR/"*) echo 'Отчёты должны быть вне папки записей' >&2; exit 2 ;; esac
 case "$BENCH_CACHE/" in "$BENCH_AUDIO_DIR/"*) echo 'Кеш должен быть вне папки записей' >&2; exit 2 ;; esac
 BENCH_RUN_OUT="$BENCH_OUT/$BENCH_RUN_ID"
@@ -74,7 +90,7 @@ BENCH_PREPARE_CONTAINER="speech-comparison-audio-prepare-$BENCH_RUN_ID"
 BENCH_CLIENT_CONTAINER="speech-comparison-client-$BENCH_RUN_ID"
 BENCH_WHISPER_DOWNLOAD_CONTAINER="speech-comparison-whisper-download-$BENCH_RUN_ID"
 BENCH_ARTIFACTS_CONTAINER="speech-comparison-artifacts-$BENCH_RUN_ID"
-if (( ! BENCH_GIGAAM_ONLY )); then
+if (( ! BENCH_SKIP_WHISPER )); then
     mkdir -p "$BENCH_CACHE/whisper"
 fi
 mkdir -p "$BENCH_RUN_OUT/логи"
@@ -193,10 +209,10 @@ cleanup() {
     docker stop --time 10 "$BENCH_GIGA_CONTAINER" >/dev/null 2>&1 || true
     docker stop --time 10 "$BENCH_FIRST_LINE_CONTAINER" >/dev/null 2>&1 || true
     docker stop --time 10 "$BENCH_PREFETCH_CONTAINER" >/dev/null 2>&1 || true
-    if (( BENCH_GIGAAM_ONLY )); then
+    if (( BENCH_SKIP_WHISPER )); then
         docker stop --time 10 "$BENCH_PREPARE_CONTAINER" >/dev/null 2>&1 || true
     fi
-    if (( ! BENCH_GIGAAM_ONLY )); then
+    if (( ! BENCH_SKIP_WHISPER )); then
         docker stop --time 10 "$BENCH_CLIENT_CONTAINER" >/dev/null 2>&1 || true
         docker stop --time 10 "$BENCH_WHISPER_DOWNLOAD_CONTAINER" >/dev/null 2>&1 || true
     fi
@@ -288,7 +304,10 @@ check_capacity() {
         [[ "$free_disk" =~ ^[0-9]+$ ]] && (( free_disk >= BENCH_MIN_DISK )) || return 1
     done
 }
-if (( BENCH_GIGAAM_ONLY )); then
+if [[ -n "$BENCH_RESUME_FROM" ]]; then
+    echo "Прогон $BENCH_RUN_ID: продолжение $BENCH_RESUME_FROM → полный GigaAM → GigaAM первая линия; GPU $BENCH_GPU."
+    echo 'Замеры Whisper копируются без повторных запросов. Восстановленный PCM проверяется по SHA256; прежняя папка сохраняется.'
+elif (( BENCH_GIGAAM_ONLY )); then
     echo "Прогон $BENCH_RUN_ID: только полный цикл GigaAM; GPU $BENCH_GPU."
     echo 'Whisper не запускается; его предыдущие результаты остаются в прежней папке.'
 else
@@ -310,7 +329,7 @@ if ! check_capacity; then
 fi
 docker compose version
 docker buildx version
-if (( BENCH_GIGAAM_ONLY )); then
+if (( BENCH_SKIP_WHISPER )); then
     bench_running_whisper=$(bench_compose ps --status running --quiet whisper-bench)
     if [[ -n "$bench_running_whisper" ]]; then
         echo 'Тестовый Whisper ещё работает. Сначала проверьте и остановите его контейнер в проекте speech-comparison; GigaAM не запускается.'
@@ -330,7 +349,11 @@ BENCH_CLIENT_READY=1
     gpu_monitor
 ) &
 BENCH_MONITOR_PID=$!
-if (( BENCH_GIGAAM_ONLY )); then
+if [[ -n "$BENCH_RESUME_FROM" ]]; then
+    run_task 0 "$BENCH_PREPARE_CONTAINER" продолжение-whisper.log audio-prepare "$@" \
+        --phase gigaam-resume --resume-from "/results/$(basename -- "$BENCH_RESUME_FROM")" \
+        --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
+elif (( BENCH_GIGAAM_ONLY )); then
     run_task 0 "$BENCH_PREPARE_CONTAINER" подготовка-аудио.log audio-prepare "$@" \
         --phase gigaam-prepare --audio-dir /recordings --out "/results/$BENCH_RUN_ID"
 else
@@ -362,7 +385,12 @@ BENCH_DOWNLOAD_STARTED=1
 bench_compose up -d --wait --wait-timeout 60 ollama-download
 timeout 7200 docker compose --project-name speech-comparison --project-directory "$BENCH_PROJECT_DIR" \
     -f "$BENCH_PROJECT_DIR/compose.benchmark.yml" exec --interactive=false -T ollama-download sh -c \
-    'exec ollama pull "$LLM_MODEL"' \
+    'if ollama show "$LLM_MODEL" >/dev/null 2>&1; then
+        echo "GigaChat уже есть в кеше: $LLM_MODEL; загрузка из интернета не требуется."
+     else
+        echo "GigaChat отсутствует в кеше: $LLM_MODEL; скачиваем веса вне замеров."
+        exec ollama pull "$LLM_MODEL"
+     fi' \
     2>&1 | tee -i "$BENCH_RUN_OUT/логи/загрузка-llm.log"
 bench_compose stop ollama-download
 if ! check_capacity; then

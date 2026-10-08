@@ -174,6 +174,9 @@ def render_three_systems(output: Path, rows: list, conditions: dict, summary: di
         texts.append('</div></details>')
     changes = summary["matched_comparison"].get("time_change_vs_whisper_percent", {})
     comparison = " ".join(f'{SYSTEMS[system]}: {value:+.1f}% времени относительно Whisper.' for system, value in changes.items() if system != "whisper")
+    resume_note = (f'<p>Продолжение прогона {escape(conditions["resume"]["source_run"])}: замеры Whisper перенесены без изменения, '
+                   'полный GigaAM и первая линия измеряются позже. Входной звук проверен по SHA256. Исходные логи сохранены в источник-whisper.</p>'
+                   if conditions.get("resume") else '')
     html = ('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
         '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'
         '<title>Три режима обработки разговоров</title><style>'
@@ -186,6 +189,7 @@ def render_three_systems(output: Path, rows: list, conditions: dict, summary: di
         '<p>Первая линия: только поиск речи и распознавание. Голоса, эмоции и GigaChat отключены; её контейнер не имеет сети.</p>'
         '<p>Во всех трёх режимах используется одна моно копия каждой записи. Роли из исходных каналов здесь не восстанавливаются.</p>'
         '<p>Загрузка, прогрев, тестовые паузы и запись отчёта исключены из времени обработки. За 15 минут — расчёт для похожего набора после подготовки моделей.</p>'
+        + resume_note
         + '<div class="cards">' + ''.join(cards) + '</div>'
         + f'<p>Для сравнения полностью успешно обработано всеми тремя режимами: {summary["matched_comparison"]["records"]}. {comparison}</p>'
         + '<p>GPU общая с рабочими сервисами. Их нагрузка влияет на время. Скорость не показывает точность распознавания.</p>'

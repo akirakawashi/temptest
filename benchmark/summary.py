@@ -34,6 +34,9 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
                   "Загрузка общей GPU включает продовые процессы; влияние на время не исключено.",
                   "Паузы — оценка VAD; скорость и различие текстов не определяют точность.",
                   "Суммы вызовов моделей могут пересекаться. exclusive_wall_percent учитывает пересечения отдельно."]}
+    if conditions.get("resume"):
+        summary["resume"] = conditions["resume"]
+        summary["notes"].append("Замеры Whisper перенесены из предыдущего запуска без изменения; PCM восстановлен и проверен по SHA256. Даты замеров различаются.")
     preparations = {(p.get("directory"), p.get("system")): p for p in conditions.get("preparations", [])}
     csv_rows = []
     for system in systems:

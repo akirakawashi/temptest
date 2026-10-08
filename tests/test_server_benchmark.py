@@ -319,8 +319,9 @@ def test_gigaam_only_prepares_new_corpus_without_whisper_and_preserves_previous_
         assert "GigaAM — полный цикл: 6.000 с" in (output / "отчёт.md").read_text()
 
 
-@pytest.mark.parametrize("failure", [None, "build", "prefetch", "gigaam", "whisper-running", "hup"])
-def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_path, failure):
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("failure", [None, "build", "prefetch", "gigaam", "whisper-running", "hup", "prepare"])
+def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_path, failure, resume):
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     (folder / "audio").mkdir()
@@ -329,6 +330,7 @@ def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_pa
     previous = folder / "benchmark-results" / "previous" / "whisper.json"
     previous.parent.mkdir(parents=True)
     previous.write_text("Сохранённый Whisper")
+    (previous.parent / "условия.json").write_text('{}')
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     command_log = tmp_path / "commands.log"
@@ -343,7 +345,7 @@ def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_pa
                       ' if "-gigaam-" in a[-1] and failure=="hup":\n'
                       '  Path(os.environ["READY"]).touch()\n'
                       '  while True: time.sleep(60)\n'
-                      ' print(51 if "-prefetch-" in a[-1] and failure=="prefetch" else 47 if "-gigaam-" in a[-1] and failure=="gigaam" else 0)\n'
+                      ' print(51 if "-prefetch-" in a[-1] and failure=="prefetch" else 47 if "-gigaam-" in a[-1] and failure=="gigaam" else 53 if "-audio-prepare-" in a[-1] and failure=="prepare" else 0)\n'
                       'if a[0]=="logs" and "--follow" in a:\n'
                       ' print("Тест: журнал GigaAM",flush=True)\n'
                       ' while True: time.sleep(60)\n'
@@ -357,8 +359,9 @@ def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_pa
            "FAILURE": failure or "", "READY": str(ready), "BENCH_GPU_MIN_FREE_MIB": "12288",
            "BENCH_GPU_MAX_UTIL": "100", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     with (tmp_path / "terminal.log").open("w") as terminal:
+        mode = ["--resume-gigaam", str(previous.parent)] if resume else ["--gigaam-only"]
         process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio"),
-                                    "--gigaam-only", "--expected-files", "2"], env=env, stdin=subprocess.DEVNULL,
+                                    *mode, "--expected-files", "2"], env=env, stdin=subprocess.DEVNULL,
                                    stdout=terminal, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             if failure == "hup":
@@ -373,7 +376,7 @@ def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_pa
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-    assert code == {None: 0, "build": 23, "prefetch": 51, "gigaam": 47, "whisper-running": 42, "hup": 129}[failure]
+    assert code == {None: 0, "build": 23, "prefetch": 51, "gigaam": 47, "whisper-running": 42, "hup": 129, "prepare": 53}[failure]
     assert previous.read_text() == "Сохранённый Whisper"
     commands = [ast.literal_eval(line) for line in command_log.read_text().splitlines()]
     for command in commands:
@@ -386,14 +389,22 @@ def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_pa
             assert command[0] == "compose" and "ps" in command
         if command[0] == "compose" and command[1:] != ["version"]:
             assert command[command.index("--project-name") + 1] == "speech-comparison"
-    gigaam_runs = [c for c in commands if c[0] == "compose" and "run" in c and "gigaam-only" in c]
-    assert bool(gigaam_runs) is (failure not in {"build", "prefetch", "whisper-running"})
+    gigaam_runs = [c for c in commands if c[0] == "compose" and "run" in c and "compare" in c]
+    assert bool(gigaam_runs) is (failure not in {"build", "prefetch", "whisper-running", "prepare"})
     if gigaam_runs:
         assert "--expected-files" in gigaam_runs[0] and "2" in gigaam_runs[0]
         assert "compare" in gigaam_runs[0] and "--detach" in gigaam_runs[0]
         preparation = next(c for c in commands if "audio-prepare" in c and "run" in c)
-        assert "gigaam-prepare" in preparation
+        assert ("gigaam-resume" if resume else "gigaam-prepare") in preparation
         assert commands.index(preparation) < commands.index(gigaam_runs[0])
+        assert ("gigaam" if resume else "gigaam-only") in gigaam_runs[0]
+        first_runs = [c for c in commands if "gigaam-first-line" in c]
+        assert bool(first_runs) is (resume and failure is None)
+        if first_runs:
+            stop_ollama = next(c for c in commands if "stop" in c and "ollama" in c)
+            assert commands.index(gigaam_runs[0]) < commands.index(stop_ollama) < commands.index(first_runs[0])
+    if failure == "prepare":
+        assert not any("compare" in c and "build" in c or "ollama" in c and "up" in c for c in commands)
     logs = list((folder / "benchmark-results").glob("*/логи/запуск.log"))
     assert len(logs) == 1
     if failure == "hup":
