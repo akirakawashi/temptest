@@ -19,6 +19,65 @@ from benchmark.whisper_api import TEST_URL, WhisperAPI, speech_seconds, validate
 from test_benchmark import install_fake_runners, write_wav
 
 
+@pytest.mark.parametrize("phase,count,expected_code", [
+    ("gigaam-prepare", "2", 0), ("gigaam-prepare", "3", 1), ("whisper-api", "3", 1),
+])
+def test_cpu_preparation_and_artifacts_work_with_only_benchmark_package(tmp_path, phase, count, expected_code):
+    """Как COPY benchmark в CPU-образе: app отсутствует, моделей и API нет."""
+    project = Path(__file__).resolve().parents[1]
+    image = tmp_path / "cpu-image"
+    shutil.copytree(project / "benchmark", image / "benchmark", ignore=shutil.ignore_patterns("__pycache__"))
+    source, output = tmp_path / "audio", tmp_path / "results"
+    source.mkdir()
+    write_wav(source / "1.wav", 100)
+    write_wav(source / "2.wav", 200)
+    bootstrap = '''
+import importlib.abc, os, runpy, sys, types, wave
+sys.path.insert(0, sys.argv.pop(1))
+sys.path.append(os.environ["CPU_TEST_NUMPY_PATH"])
+module = sys.argv.pop(1)
+class NoModels(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in {"app", "torch", "gigaam", "sherpa_onnx", "onnxruntime", "ctranslate2"}:
+            raise ModuleNotFoundError("Недоступно в CPU-контейнере: " + fullname)
+sys.meta_path.insert(0, NoModels())
+if module == "benchmark.compare":
+    import numpy as np
+    from benchmark import compare
+    compare.shutil.which = lambda name: None
+    def decode_audio(path, sampling_rate):
+        with wave.open(path, "rb") as wav:
+            return np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(np.float32) / 32768
+    decoder = types.ModuleType("faster_whisper.audio")
+    decoder.decode_audio = decode_audio
+    sys.modules["faster_whisper"] = types.ModuleType("faster_whisper")
+    sys.modules["faster_whisper.audio"] = decoder
+runpy.run_module(module, run_name="__main__")
+'''
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "LLM_NUM_CTX": "8192",
+           "CPU_TEST_NUMPY_PATH": str(Path(sys.modules["numpy"].__file__).resolve().parents[1]),
+           "BENCH_LLM_NUM_BATCH": "64", "BENCH_LLM_KV_CACHE_TYPE": "q8_0"}
+    command = [sys.executable, "-I", "-c", bootstrap, str(image), "benchmark.compare",
+               "--phase", phase, "--audio-dir", str(source), "--out", str(output),
+               "--expected-files", count, "--threads", "1"]
+    prepared = subprocess.run(command, cwd=image, env=env, capture_output=True, text=True, timeout=15)
+    assert prepared.returncode == expected_code, prepared.stdout + prepared.stderr
+    conditions = json.loads((output / "условия.json").read_text())
+    assert conditions["gigaam"]["llm_runtime"]["options"]["num_ctx"] == 8192
+    if expected_code == 0:
+        assert conditions["state"] == "GigaAM подготовлен" and len(conditions["records"]) == 2
+        assert len(list((output / "временные").glob("*.wav"))) == 3
+    assert not list(output.rglob("gigaam.json")) and not list(output.rglob("whisper.json"))
+    finalized = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(image), "benchmark.artifacts",
+                                str(output), "--exit-code", str(expected_code)], cwd=image, env=env,
+                               capture_output=True, text=True, timeout=15)
+    assert finalized.returncode == 0, finalized.stdout + finalized.stderr
+    assert not (output / "временные").exists()
+    with tarfile.open(output / "диагностика.tar.gz") as archive:
+        assert "отчёт.html" in archive.getnames()
+        assert all(not name.endswith(".wav") for name in archive.getnames())
+
+
 def test_gpu_reserve_stops_only_benchmark_model_loading(monkeypatch):
     from types import SimpleNamespace
     from benchmark.gpu import log_gpu_memory
