@@ -44,6 +44,32 @@ BENCH_API_TIMEOUT=1200
 Доступ к Docker registry, PyPI, PyTorch, GitHub и источникам весов по-прежнему
 нужен. Реальная сборка и GPU-прогон выполняются владельцем на сервере.
 
+CUDA-пакет `sherpa-onnx==1.13.4+cuda12.cudnn9` для CAM++ устанавливается
+по прямой ссылке Hugging Face из [официального каталога CUDA wheels](https://k2-fsa.github.io/sherpa/onnx/cuda.html).
+Сборке больше не требуется доступ к странице индекса `k2-fsa.github.io`,
+на которой предыдущий запуск остановился с `Network is unreachable`.
+Ревизия хранилища и SHA256 файла зафиксированы; пакет рассчитан на Python 3.12
+и Linux x64. Он устанавливается отдельным слоем Docker, поэтому при сбое
+его загрузки успешно собранные слои GigaAM и ONNX Runtime сохраняются в кеше.
+
+Перед повторным прогоном сборку GigaAM можно проверить отдельно, без запуска
+распознавания, подключения GPU и изменения работающих контейнеров:
+
+```bash
+cd /home/aleksandr.ozherelev@ic-group.ru/dev/temptest
+set -o pipefail
+BENCH_AUDIO_DIR="$(cd ../audio && pwd)" \
+BENCH_OUT="$PWD/benchmark-results" \
+BENCH_CACHE="$PWD/benchmark-cache" \
+  docker compose --project-name speech-comparison \
+    -f compose.benchmark.yml --progress plain build compare \
+  2>&1 | tee /tmp/speech-build-gigaam.log
+```
+
+Сборка скачивает библиотеки и публичные модели. Аудиозаписи ей не передаются.
+Полученный образ и кеш будут использованы следующим запуском `run.sh`.
+Прежние результаты Whisper удалять не нужно.
+
 Отдельные контейнеры загрузки весов по умолчанию используют сеть сервера
 (`host`), обходя выход в интернет через Docker bridge. Это не меняет
 сеть работающих контейнеров и настройки Docker. Доступность Hugging Face,

@@ -23,9 +23,12 @@ RUN sed '/^sherpa-onnx==/d; /^onnxruntime==/d' /tmp/app-requirements.txt > /tmp/
 ARG GIGAAM_REF=7447938d791c4f3e643386ee22c33777004293a5
 RUN pip install "gigaam @ https://github.com/salute-developers/GigaAM/archive/${GIGAAM_REF}.zip" \
  && pip uninstall -y onnxruntime \
- && pip install onnxruntime-gpu==1.24.4 \
- && pip install 'sherpa-onnx==1.13.4+cuda12.cudnn9' \
-      -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
+ && pip install onnxruntime-gpu==1.24.4
+# Прямой CUDA wheel из официального каталога sherpa-onnx: индекс github.io
+# недоступен с сервера. Ревизия и SHA256 фиксируют файл для Python 3.12/Linux x64.
+# Зависимости уже установлены выше; pip не обращается к другим индексам.
+RUN pip install --no-deps \
+    'sherpa-onnx @ https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/4de10716b1043c13380c79f3f12127a6c6429650/cuda/1.13.4/sherpa_onnx-1.13.4%2Bcuda12.cudnn9-cp312-cp312-linux_x86_64.whl#sha256=76ffc8a204a00df51d2d8e87f38c204640370b45c24c33f0e1b87d846aeb6c52'
 RUN useradd --system --uid 10001 --no-create-home app \
  && mkdir -p /cache/gigaam \
  && chown -R app /cache
