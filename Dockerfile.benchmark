@@ -29,6 +29,22 @@ RUN pip install "gigaam @ https://github.com/salute-developers/GigaAM/archive/${
 # Зависимости уже установлены выше; pip не обращается к другим индексам.
 RUN pip install --no-deps \
     'sherpa-onnx @ https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/4de10716b1043c13380c79f3f12127a6c6429650/cuda/1.13.4/sherpa_onnx-1.13.4%2Bcuda12.cudnn9-cp312-cp312-linux_x86_64.whl#sha256=76ffc8a204a00df51d2d8e87f38c204640370b45c24c33f0e1b87d846aeb6c52'
+# CUDA wheel связан с ALSA даже при обработке файлов без звукового устройства.
+# В Ubuntu 24.04 базового образа её нет. Прямые пакеты с SHA256 сохраняют
+# сборку без apt; отдельный слой оставляет тяжёлые Python/CUDA-пакеты в кеше.
+RUN curl -fL --retry 3 --connect-timeout 20 --max-time 120 \
+      -o /tmp/libasound2-data.deb \
+      https://security.ubuntu.com/ubuntu/pool/main/a/alsa-lib/libasound2-data_1.2.11-1ubuntu0.3_all.deb \
+ && echo '0c26896193480d9dbb055e85e8ddfb9c9f34cf19afee340987cd6311e2886fc1  /tmp/libasound2-data.deb' | sha256sum -c - \
+ && curl -fL --retry 3 --connect-timeout 20 --max-time 120 \
+      -o /tmp/libasound2.deb \
+      https://security.ubuntu.com/ubuntu/pool/main/a/alsa-lib/libasound2t64_1.2.11-1ubuntu0.3_amd64.deb \
+ && echo '5d17bfb5683eb99f1be951fe48e1be5bf3c52391913b6b74a8aecf9b4f5e779f  /tmp/libasound2.deb' | sha256sum -c - \
+ && dpkg -i /tmp/libasound2-data.deb /tmp/libasound2.deb \
+ && rm /tmp/libasound2-data.deb /tmp/libasound2.deb
+# Импорт проверяет системные зависимости до запуска Ollama и GPU-прогона.
+# Модели не загружаются, GPU и аудио для этой проверки не нужны.
+RUN python -c 'import torch; import onnxruntime; import sherpa_onnx; print("GigaAM: импорт CUDA-библиотек проверен; sherpa-onnx", sherpa_onnx.__version__, "ONNX Runtime", onnxruntime.__version__)'
 RUN useradd --system --uid 10001 --no-create-home app \
  && mkdir -p /cache/gigaam \
  && chown -R app /cache
