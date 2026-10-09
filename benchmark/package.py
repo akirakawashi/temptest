@@ -17,6 +17,7 @@ EXCLUDED = {"__pycache__", ".pytest_cache", ".venv", ".env"}
 def source_files() -> list[Path]:
     paths = [ROOT / name for name in (
         "Dockerfile.benchmark", "Dockerfile.whisper-client", "compose.benchmark.yml", "requirements.txt", ".dockerignore",
+        "Dockerfile.tone-benchmark", "compose.tone-benchmark.yml",
         "scripts/download_models.sh",
     )]
     for folder in ("app", "benchmark"):

@@ -23,6 +23,7 @@ def distribution(values: list[float]) -> dict:
 
 
 def write_summary(output: Path, rows: list, conditions: dict) -> dict:
+    labels = {**SYSTEMS, "tone": "T-one"}
     systems = conditions.get("planned_systems") or (["gigaam"] if conditions.get("mode") == "gigaam_only" else ["whisper", "gigaam"])
     corpus = [{"source": r["audio"].source, "samples": r["audio"].samples, "sha256_pcm": r["audio"].sha256_pcm} for r in rows]
     summary = {"schema_version": 2, "state": conditions["state"], "records": len(rows),
@@ -37,6 +38,15 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
     if conditions.get("resume"):
         summary["resume"] = conditions["resume"]
         summary["notes"].append("Замеры Whisper перенесены из предыдущего запуска без изменения; PCM восстановлен и проверен по SHA256. Даты замеров различаются.")
+    if systems == ["tone"]:
+        summary["notes"] = [
+            "T-one — Silero VAD + локальное распознавание CUDA. Подготовка звука, загрузка моделей и прогрев исключены.",
+            "Преобразование фрагментов 16 → 8 кГц и обработка добавленной тишины включены во время ASR.",
+            "Один моно WAV на запись; голоса, эмоции и LLM отключены.",
+            "За 15 минут — расчёт по среднему времени успешных записей, без загрузки, прогрева и тестовых пауз.",
+            "GPU общая с другими сервисами; её загрузка сохранена в логи/gpu.csv. Паузы — оценка VAD.",
+            "Точность слов без сверки с аудио не определена. Исходные ответы модели сохранены без удаления чисел.",
+        ]
     preparations = {(p.get("directory"), p.get("system")): p for p in conditions.get("preparations", [])}
     csv_rows = []
     for system in systems:
@@ -48,7 +58,7 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
             if result.get("status") == "ok" and result.get("elapsed_seconds") is not None:
                 good.append(row)
             preparation = preparations.get((row["directory"], system), {})
-            item = {"ID": Path(row["directory"]).name, "Режим": SYSTEMS[system], "Запись": row["audio"].source,
+            item = {"ID": Path(row["directory"]).name, "Режим": labels[system], "Запись": row["audio"].source,
                 "SHA256 PCM": row["audio"].sha256_pcm, "Аудио, с": row["audio"].seconds,
                 "Статус": result.get("status", "pending"), "Обработка, с": result.get("elapsed_seconds"),
                 "ASR, с": result.get("asr_seconds"), "LLM, с": result.get("llm_seconds"),
@@ -61,7 +71,7 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
                 for field, label in (("seconds", "с"), ("calls", "вызовов"), ("errors", "ошибок")):
                     item[f"{title}, {label}"] = values.get(field)
             csv_rows.append(item)
-        entry = {"label": SYSTEMS[system], "statuses": counts,
+        entry = {"label": labels[system], "statuses": counts,
                  "processing_seconds": distribution([r[system]["elapsed_seconds"] for r in good]),
                  "audio_seconds_successful": sum(r["audio"].seconds for r in good),
                  "load_seconds": distribution([p["load_seconds"] for p in preparations.values() if p.get("system") == system and "load_seconds" in p]),

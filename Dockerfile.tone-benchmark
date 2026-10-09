@@ -1,0 +1,22 @@
+# Используем уже проверенные CUDA-библиотеки прежнего стенда; apt не нужен.
+# Ни GigaAM, ни Whisper, ни GigaChat в этом контейнере не загружаются.
+ARG TONE_BASE_IMAGE=speech-comparison:4.0.0-gigaam-cuda
+FROM ${TONE_BASE_IMAGE}
+USER root
+ARG TONE_MODEL=sherpa-onnx-streaming-t-one-russian-2025-09-08
+ARG TONE_SHA256=b9c907450e99a6e5049e279bf18368a17db0bdc5e63b7fa978943138debbe3ae
+RUN mkdir -p /models/tone \
+ && curl -fL --retry 3 --connect-timeout 20 --max-time 1800 \
+      "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${TONE_MODEL}.tar.bz2" \
+      -o /tmp/tone.tar.bz2 \
+ && echo "${TONE_SHA256}  /tmp/tone.tar.bz2" | sha256sum -c - \
+ && tar -xjf /tmp/tone.tar.bz2 -C /models/tone --strip-components=1 \
+      "${TONE_MODEL}/model.onnx" "${TONE_MODEL}/tokens.txt" "${TONE_MODEL}/LICENSE" \
+ && rm /tmp/tone.tar.bz2
+COPY app /srv/app
+COPY benchmark /srv/benchmark
+WORKDIR /srv
+USER app
+HEALTHCHECK NONE
+ENTRYPOINT ["python", "-m", "benchmark.tone_run"]
+CMD []

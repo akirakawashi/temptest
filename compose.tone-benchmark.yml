@@ -1,0 +1,49 @@
+name: speech-comparison-tone
+services:
+  tone:
+    image: speech-comparison:1.0.0-tone-cuda
+    build:
+      context: .
+      dockerfile: Dockerfile.tone-benchmark
+      network: ${BENCH_BUILD_NETWORK:-default}
+    platform: linux/amd64
+    init: true
+    restart: "no"
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: ${BENCH_WORKER_MEMORY:-8g}
+    network_mode: none
+    tmpfs:
+      - /tmp:uid=${BENCH_UID:-1000},gid=${BENCH_GID:-1000},mode=0700
+    environment:
+      BENCH_THREADS: ${BENCH_THREADS:-4}
+      BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
+      BENCH_GPU: ${BENCH_GPU:-0}
+      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-3072}
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      OMP_NUM_THREADS: ${BENCH_THREADS:-4}
+      MKL_NUM_THREADS: ${BENCH_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${BENCH_THREADS:-4}
+      PYTHONFAULTHANDLER: "1"
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      EMO_ENABLED: "false"
+      LLM_ENABLED: "false"
+      SPLIT_TURNS: "false"
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_AUDIO_DIR:?Укажите папку аудио}:/recordings:ro
+      - ${BENCH_OUT:?Укажите папку результатов}:/results
+      - ${BENCH_REFERENCE_DIR:?Укажите папку эталона}:/reference:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${BENCH_GPU:-0}"]
+              capabilities: [gpu]

@@ -141,3 +141,9 @@ Ollama, общую GPU CSV и подробные результаты каждо
 ```bash
 python3 benchmark/package.py --out ../speech-comparison-server.tar.gz
 ```
+
+# Отдельный T-one
+
+Для прогона только T-one на тех же аудиозаписях используйте
+`bash benchmark/run-tone.sh ../audio`. Запуск, проверка корпуса предыдущего теста
+и описание результатов — в [TONE.md](TONE.md).
