@@ -18,6 +18,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+from benchmark.audio_check import decoder_info
 from benchmark.compare import FORMATS, Audio, host_info, prepare_audio, setup_logging
 from benchmark.summary import write_summary
 
@@ -71,6 +72,7 @@ def prepare(args, conditions: dict) -> list[dict]:
             if settings.get("asr_threads", args.threads) != args.threads:
                 raise ValueError("Число потоков отличается от исходного GigaAM; установите BENCH_THREADS как в исходном прогоне")
     selected = reference_files(files, reference, args.expected_files)
+    (args.out / "временные").mkdir(parents=True, exist_ok=True)
     rows = []
     for index, (source, directory, old) in enumerate(selected, 1):
         target = args.out / "временные" / f"{Path(directory).name}.wav"
@@ -210,6 +212,7 @@ async def run(args):
         "state": "Подготовка", "started_at": datetime.now().astimezone().isoformat(),
         "host": host_info(), "selected_gpu": os.environ.get("BENCH_GPU", "0"), "records": [], "preparations": [],
         "vad_settings": dict(VAD_SETTINGS), "production_service_management": False, "production_requests": False,
+        "audio_decoder": decoder_info(),
         "guard_policy": {key: os.environ.get(key) for key in (
             "BENCH_GPU_MIN_FREE_MIB", "BENCH_GPU_MAX_UTIL", "BENCH_GPU_RESERVE_MIB")},
         "source_sha256": {str(path.relative_to(Path(__file__).resolve().parent.parent)):
@@ -226,6 +229,8 @@ async def run(args):
             "disabled_stages": ["speaker", "emotion", "llm"]}}
     rows, code, started = [], 1, time.perf_counter()
     try:
+        save_json(args.out / "условия.json", conditions)
+        log.info("Декодер аудио перед подготовкой: %s", conditions["audio_decoder"])
         rows = prepare(args, conditions)
         conditions["state"] = "T-one выполняется"
         update(args.out, rows, conditions)

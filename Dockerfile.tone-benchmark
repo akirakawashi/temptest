@@ -13,9 +13,15 @@ RUN mkdir -p /models/tone \
  && tar -xjf /tmp/tone.tar.bz2 -C /models/tone --strip-components=1 \
       "${TONE_MODEL}/model.onnx" "${TONE_MODEL}/tokens.txt" "${TONE_MODEL}/LICENSE" \
  && rm /tmp/tone.tar.bz2
+# Старый CUDA-образ мог получить новую несовместимую PyAV при установке зависимостей.
+# Ставим известный совместимый wheel в окружение T-one, не меняя базовый образ.
+RUN pip install --only-binary=:all: --no-deps av==15.1.0
 COPY app /srv/app
 COPY benchmark /srv/benchmark
 WORKDIR /srv
+# Настоящее чтение и преобразование звука, а не только импорт библиотек.
+# Используются сгенерированные WAV, без аудио пользователя, GPU и загрузки ASR.
+RUN python -m benchmark.audio_check
 USER app
 HEALTHCHECK NONE
 ENTRYPOINT ["python", "-m", "benchmark.tone_run"]

@@ -1,7 +1,7 @@
 name: speech-comparison-tone
 services:
   tone:
-    image: speech-comparison:1.0.0-tone-cuda
+    image: speech-comparison:1.0.1-tone-cuda
     build:
       context: .
       dockerfile: Dockerfile.tone-benchmark

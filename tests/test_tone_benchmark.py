@@ -172,7 +172,6 @@ def args_for(tmp_path, count=2):
 
 
 def fake_prepare(source, target, max_seconds=None):
-    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(source.read_bytes())
     with wave.open(str(target)) as wav:
         raw = wav.readframes(wav.getnframes())

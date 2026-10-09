@@ -80,7 +80,7 @@ cleanup() {
             --network none --memory 2g --cpus 1 --user "$BENCH_UID:$BENCH_GID" \
             --env NVIDIA_VISIBLE_DEVICES=void --env TZ=Europe/Moscow \
             --volume "$BENCH_OUT:/results" --entrypoint python \
-            speech-comparison:1.0.0-tone-cuda -m benchmark.tone_run \
+            speech-comparison:1.0.1-tone-cuda -m benchmark.tone_run \
             --finalize "/results/$TONE_RUN_ID" "$exit_code"; then
             finalized=1
         else
@@ -144,7 +144,7 @@ if ! docker image inspect speech-comparison:4.0.0-gigaam-cuda >/dev/null 2>&1; t
 fi
 tone_compose --progress plain build tone
 TONE_IMAGE_READY=1
-docker image inspect --format '{{json .}}' speech-comparison:1.0.0-tone-cuda > "$TONE_RUN_OUT/логи/образ.json"
+docker image inspect --format '{{json .}}' speech-comparison:1.0.1-tone-cuda > "$TONE_RUN_OUT/логи/образ.json"
 if ! check_capacity; then echo 'После сборки недостаточно ресурсов; модели не запускались.'; exit 42; fi
 TONE_STARTED=1
 tone_compose run --detach --no-deps --name "$TONE_CONTAINER" tone \
