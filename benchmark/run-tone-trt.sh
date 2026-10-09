@@ -11,6 +11,7 @@ export BENCH_AUDIO_DIR="$(cd -- "$1" && pwd -P)"
 shift
 TRT_ARGS=() TRT_REFERENCE_ARGS=() TRT_DOWNLOAD_ARGS=()
 TRT_REFERENCE=''
+TRT_IMAGE='nvcr.io/nvidia/tritonserver:25.06-py3'
 while (( $# )); do
     case "$1" in
         --reference-run)
@@ -138,7 +139,7 @@ start_container() {
     local name=$1 service=$2 id
     shift 2
     [[ ! -f "$BENCH_RUN_OUT/логи/остановка-по-памяти.txt" ]] || return 42
-    trt_compose run --detach --no-deps --use-aliases --name "$name" "$service" "$@"
+    trt_compose run --detach --no-deps --pull never --use-aliases --name "$name" "$service" "$@"
     id=$(timeout 10 docker inspect --format '{{.Id}}' "$name")
     [[ "$id" =~ ^[a-f0-9]{12,64}$ ]] || return 1
     printf '%s\n' "$id" >> "$TRT_OWN_FILE"
@@ -175,14 +176,28 @@ if [[ -n "$active" ]]; then
     exit 2
 fi
 if ! check_capacity; then echo 'Недостаточно ресурсов; модели не запускались.'; exit 42; fi
+# docker load позволяет перенести тот же официальный образ с другой машины.
+# Если он уже есть, не обращаемся к nvcr.io даже за проверкой манифеста.
+if docker image inspect "$TRT_IMAGE" >/dev/null 2>&1; then
+    echo "Официальный образ Triton уже есть локально: $TRT_IMAGE. Повторного скачивания не будет."
+else
+    echo "Загружаем официальный образ Triton: $TRT_IMAGE — до сборки клиента и запуска моделей."
+    if ! docker pull "$TRT_IMAGE"; then
+        echo "Не удалось скачать $TRT_IMAGE. Обработка записей не начиналась."
+        echo 'Если реестр отвечает 403 Forbidden, доступ отклонён; код ответа не устанавливает точную причину.'
+        echo 'Нужен доступ к nvcr.io либо перенос этого официального образа через docker image save / docker image load.'
+        echo 'После переноса повторите ту же команду. Удалять прошлые результаты и кеш не требуется.'
+        echo 'Инструкция: benchmark/TONE-TRT.md, раздел «Если nvcr.io отвечает 403 Forbidden».'
+        exit 1
+    fi
+fi
 if ! docker image inspect speech-comparison:4.0.0-gigaam-cuda >/dev/null 2>&1; then
     echo 'Собираем библиотечный CUDA-образ прежнего стенда; сервисы не запускаются.'
     docker compose --project-name speech-comparison-tone-trt -f "$TRT_PROJECT_DIR/compose.benchmark.yml" \
         --progress plain build compare
 fi
 trt_compose --progress plain build client
-trt_compose pull export triton
-docker image inspect speech-comparison:2.0.0-tone-trt-client nvcr.io/nvidia/tritonserver:25.06-py3 \
+docker image inspect speech-comparison:2.0.0-tone-trt-client "$TRT_IMAGE" \
     > "$BENCH_RUN_OUT/логи/образы.json"
 if ! check_capacity; then echo 'После сборки недостаточно ресурсов.'; exit 42; fi
 start_container "speech-comparison-tone-trt-download-$TRT_RUN_ID" download \

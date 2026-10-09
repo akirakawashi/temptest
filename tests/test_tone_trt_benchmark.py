@@ -313,11 +313,21 @@ def test_finalize_works_without_dependencies_or_models(tmp_path):
     assert (tmp_path / "диагностика.tar.gz").is_file()
 
 
-@pytest.mark.parametrize("free_mib,client_code,hang_logs", [(18000, 0, False), (18000, 1, True), (2000, 0, False)])
-def test_launcher_stops_only_exact_owned_ids_and_never_hangs_on_finished_logs(tmp_path, free_mib, client_code, hang_logs):
+@pytest.mark.parametrize("free_mib,client_code,hang_logs,image_cached,pull_denied", [
+    (18000, 0, False, True, False),
+    (18000, 1, True, True, False),
+    (2000, 0, False, False, False),
+    (18000, 0, False, False, False),
+    (18000, 0, False, False, True),
+])
+def test_launcher_stops_only_exact_owned_ids_and_never_hangs_on_finished_logs(
+        tmp_path, free_mib, client_code, hang_logs, image_cached, pull_denied):
     binary, audio = tmp_path / "bin", tmp_path / "audio"
     binary.mkdir(); audio.mkdir()
     commands, containers = tmp_path / "commands.jsonl", tmp_path / "containers.json"
+    image = tmp_path / "triton-image-present"
+    if image_cached:
+        image.touch()
     script = f'''#!{sys.executable}
 import fcntl,hashlib,json,os,signal,sys,time
 from pathlib import Path
@@ -329,6 +339,14 @@ if Path(sys.argv[0]).name=='nvidia-smi':
     else: print('2026/10/09 12:00:00, GPU-test, 100, 77000, {free_mib}, 95000, 200, 45')
     sys.exit(0)
 path=Path(os.environ['FAKE_CONTAINERS'])
+image=Path(os.environ['FAKE_IMAGE'])
+if args[:2]==['image','inspect']:
+    if 'nvcr.io/nvidia/tritonserver:25.06-py3' in args and not image.exists(): sys.exit(1)
+    print('[]'); sys.exit(0)
+if args[0]=='pull':
+    if {pull_denied!r}:
+        print('unexpected status: 403 Forbidden',file=sys.stderr); sys.exit(1)
+    image.touch(); sys.exit(0)
 with open(str(path)+'.lock','a') as lock:
     fcntl.flock(lock,fcntl.LOCK_EX)
     registry=json.loads(path.read_text()) if path.exists() else {{}}
@@ -363,11 +381,13 @@ if args[0]=='logs':
         executable.chmod(0o755)
     env = {**os.environ, "PATH": str(binary) + ":" + os.environ["PATH"],
         "FAKE_COMMANDS": str(commands), "FAKE_CONTAINERS": str(containers), "FAKE_ROOT": str(tmp_path),
+        "FAKE_IMAGE": str(image),
         "BENCH_OUT": str(tmp_path / "results"), "BENCH_CACHE": str(tmp_path / "cache"),
         "BENCH_GPU_MAX_UTIL": "100", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     launched = subprocess.run(["bash", str(ROOT / "benchmark/run-tone-trt.sh"), str(audio)],
         env=env, capture_output=True, text=True, timeout=20)
-    assert launched.returncode == (42 if free_mib < 12288 else client_code), launched.stdout + launched.stderr
+    expected = 42 if free_mib < 12288 else (1 if pull_denied else client_code)
+    assert launched.returncode == expected, launched.stdout + launched.stderr
     journal = [json.loads(line) for line in commands.read_text().splitlines()]
     docker = [cmd[1:] for cmd in journal if cmd[0] == "docker"]
     assert not any(any(word in cmd for word in ("rm", "prune", "up", "down")) for cmd in docker)
@@ -375,14 +395,29 @@ if args[0]=='logs':
     for cmd in docker:
         if cmd[0] == "compose":
             assert cmd[cmd.index("--project-name") + 1] == "speech-comparison-tone-trt"
-    registry = json.loads(containers.read_text())
+    registry = json.loads(containers.read_text()) if containers.exists() else {}
     stops = [cmd[-1] for cmd in docker if cmd[0] == "stop"]
     assert set(stops) <= set(registry)
     assert all(not registry[cid]["running"] for cid in stops)
     assert list((tmp_path / "results").glob("tone-trt-*/диагностика.tar.gz"))
+    pulls = [cmd for cmd in docker if cmd[0] == "pull"]
+    assert not any(cmd[0] == "compose" and "pull" in cmd for cmd in docker)
     if free_mib < 12288:
         assert not stops and not any(cmd[0] == "compose" for cmd in docker)
+        assert not pulls
+    elif pull_denied:
+        assert not stops and not registry and not any(cmd[0] == "compose" for cmd in docker)
+        assert pulls == [["pull", "nvcr.io/nvidia/tritonserver:25.06-py3"]]
+        assert "403 Forbidden" in launched.stdout + launched.stderr
+        assert "Обработка записей не начиналась" in launched.stdout
+        with tarfile.open(next((tmp_path / "results").glob("tone-trt-*/диагностика.tar.gz"))) as archive:
+            assert any(name.endswith("запуск.log") for name in archive.getnames())
     else:
         assert len(stops) == 4
         runs = [cmd for cmd in docker if cmd[0] == "compose" and "run" in cmd]
         assert len(runs) == 4 and all("--no-deps" in cmd for cmd in runs)
+        assert all(cmd[cmd.index("--pull") + 1] == "never" for cmd in runs)
+        assert len(pulls) == (0 if image_cached else 1)
+        if pulls:
+            build_index = next(i for i, cmd in enumerate(docker) if cmd[0] == "compose" and "build" in cmd)
+            assert docker.index(pulls[0]) < build_index
