@@ -110,10 +110,24 @@ def verify_archive(path):
             raise RuntimeError("Образ должен иметь платформу linux/amd64")
 
 
+def load_archive(path, log):
+    # Импортируется проверенный образ; операции с контейнерами отсутствуют.
+    print("Загрузка готового образа в локальный Docker...", flush=True)
+    result = subprocess.run(["docker", "image", "load", "--input", str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(result.stdout, end="", flush=True)
+    log.write(result.stdout)
+    log.flush()
+    result.check_returncode()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-only", action="store_true", help="Проверить доступ, без скачивания слоёв Triton")
+    parser.add_argument("--load", action="store_true", help="После проверки архива загрузить образ в Docker этой машины")
     args = parser.parse_args()
+    if args.check_only and args.load:
+        parser.error("--check-only и --load нельзя указывать вместе")
     root = Path(__file__).resolve().parents[1]
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     folder = root / "benchmark-cache" / "triton-image-transfer" / run_id
@@ -157,8 +171,14 @@ def main():
     (folder / "образ.json").write_text(json.dumps({"source": TRITON_SOURCE,
         "tag": TRITON_TAG, "platform": "linux/amd64", "archive_sha256": digest.hexdigest(),
         "container": name, "skopeo_image": SKOPEO_IMAGE}, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Готово: {target}\nПередай архив и файл .sha256 на сервер.")
-    print("На сервере: sha256sum -c triton-25.06-py3.tar.sha256 && docker image load -i triton-25.06-py3.tar")
+    print(f"Архив готов: {target}", flush=True)
+    if args.load:
+        with (folder / "загрузка.log").open("a", encoding="utf-8") as log:
+            load_archive(target, log)
+        print(f"Готово: {TRITON_TAG} загружен в Docker. Можно запускать обычную команду теста T-one TensorRT.")
+    else:
+        print("Передай архив и файл .sha256 на сервер.")
+        print("На сервере: sha256sum -c triton-25.06-py3.tar.sha256 && docker image load -i triton-25.06-py3.tar")
 
 
 if __name__ == "__main__":

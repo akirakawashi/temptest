@@ -46,6 +46,24 @@ def test_proxy_is_passed_by_stdin_and_not_written_to_console_or_log(capsys):
     assert log.getvalue().count("[скрыто]") == 2
 
 
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_import_only_loads_archive_and_does_not_hide_docker_failure(monkeypatch, tmp_path, exit_code):
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, exit_code, stdout="Результат импорта\n")
+    monkeypatch.setattr(transfer.subprocess, "run", run)
+    target = tmp_path / "checked.tar"
+    log = io.StringIO()
+    if exit_code:
+        with pytest.raises(subprocess.CalledProcessError):
+            transfer.load_archive(target, log)
+    else:
+        transfer.load_archive(target, log)
+    assert commands == [["docker", "image", "load", "--input", str(target)]]
+    assert "Результат импорта" in log.getvalue()
+
+
 @pytest.mark.parametrize("tag,arch,accepted", [
     (transfer.TRITON_TAG, "amd64", True),
     ("other/image:latest", "amd64", False),
