@@ -10,6 +10,11 @@
 
 Команды для H100 и структура результатов — [SERVER.md](SERVER.md).
 
+Отдельный новый тест официального T-one через TensorRT/Triton:
+`bash benchmark/run-tone-trt.sh ../audio`. По умолчанию выполняются два
+прогона: без KenLM и с KenLM, по 100 записей, batch=1. Подготовка движка
+на H100 исключена из замеров; подробности — [TONE-TRT.md](TONE-TRT.md).
+
 Если Whisper завершился, а запуск остановился до первого замера GigaAM,
 продолжите командой `bash benchmark/run.sh ../audio --resume-gigaam benchmark-results/<ID>`.
 В новый отчёт переносятся прежние замеры Whisper, затем измеряются полный GigaAM

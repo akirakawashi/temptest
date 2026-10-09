@@ -1,0 +1,134 @@
+name: speech-comparison-tone-trt
+x-client: &client
+  image: speech-comparison:2.0.0-tone-trt-client
+  build:
+    context: .
+    dockerfile: Dockerfile.tone-trt-benchmark
+    network: ${BENCH_BUILD_NETWORK:-default}
+  init: true
+  restart: "no"
+  user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs:
+    - /tmp:uid=${BENCH_UID:-1000},gid=${BENCH_GID:-1000},mode=0700
+
+x-gpu: &gpu
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          device_ids: ["${BENCH_GPU:-0}"]
+          capabilities: [gpu]
+
+services:
+  download:
+    <<: *client
+    network_mode: ${BENCH_DOWNLOAD_NETWORK:-host}
+    cpus: "1"
+    mem_limit: 2g
+    environment:
+      NVIDIA_VISIBLE_DEVICES: void
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_CACHE:?Нужна папка кеша}/tone-trt:/cache
+      - ${BENCH_RUN_OUT:?Нужна папка прогона}:/results
+    entrypoint: [python, -m, benchmark.tone_trt_prepare]
+
+  export:
+    image: nvcr.io/nvidia/tritonserver:25.06-py3
+    init: true
+    restart: "no"
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "${BENCH_THREADS:-4}"
+    mem_limit: 12g
+    network_mode: none
+    tmpfs:
+      - /tmp:uid=${BENCH_UID:-1000},gid=${BENCH_GID:-1000},mode=0700
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-3072}
+      HOME: /tmp
+      CUDA_CACHE_PATH: /tmp/cuda-cache
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      TZ: Europe/Moscow
+    volumes:
+      - ./benchmark:/srv/benchmark:ro
+      - ${BENCH_CACHE:?Нужна папка кеша}/tone-trt:/cache
+      - ${BENCH_RUN_OUT:?Нужна папка прогона}:/results
+    working_dir: /srv
+    entrypoint: [python3, -m, benchmark.tone_trt_prepare]
+    deploy: *gpu
+
+  triton:
+    image: nvcr.io/nvidia/tritonserver:25.06-py3
+    init: true
+    restart: "no"
+    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: 8g
+    shm_size: 128m
+    tmpfs:
+      - /tmp:uid=${BENCH_UID:-1000},gid=${BENCH_GID:-1000},mode=0700
+    networks: [tone]
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HOME: /tmp
+      CUDA_CACHE_PATH: /tmp/cuda-cache
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_CACHE:?Нужна папка кеша}/tone-trt/repository:/models:ro
+    entrypoint: [tritonserver]
+    command:
+      - --model-repository=/models
+      - --strict-model-config=true
+      - --strict-readiness=true
+      - --model-control-mode=none
+      - --cuda-memory-pool-byte-size=0:67108864
+      - --pinned-memory-pool-byte-size=67108864
+      - --log-verbose=0
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v2/models/streaming_acoustic/versions/1/ready',timeout=5).read()"]
+      interval: 5s
+      timeout: 6s
+      retries: 60
+    deploy: *gpu
+
+  client:
+    <<: *client
+    cpus: "${BENCH_THREADS:-4}"
+    cpuset: "${BENCH_CPUSET:-0-3}"
+    mem_limit: 16g
+    networks: [tone]
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: utility
+      BENCH_THREADS: ${BENCH_THREADS:-4}
+      BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
+      BENCH_GPU: ${BENCH_GPU:-0}
+      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-3072}
+      OMP_NUM_THREADS: ${BENCH_THREADS:-4}
+      MKL_NUM_THREADS: ${BENCH_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${BENCH_THREADS:-4}
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TZ: Europe/Moscow
+    volumes:
+      - ${BENCH_AUDIO_DIR:?Нужна папка аудио}:/recordings:ro
+      - ${BENCH_RUN_OUT:?Нужна папка прогона}:/results
+      - ${BENCH_CACHE:?Нужна папка кеша}/tone-trt:/cache:ro
+      - ${BENCH_REFERENCE_DIR:?Нужна папка исходного прогона}:/reference:ro
+    # Только nvidia-smi для замеров памяти. Акустика выполняется в triton.
+    deploy: *gpu
+
+networks:
+  tone:
+    internal: true

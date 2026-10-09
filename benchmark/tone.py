@@ -14,6 +14,7 @@ from app.engines import Engines
 from app.vad import StreamingVad, default_model_path, make_onnx_session
 from benchmark.gpu import sherpa_runtime_version
 from benchmark.pipeline import FirstLinePipeline, StageTimer, TimedVad
+from benchmark.tone_audio import LOWPASS_8K, to_8k
 
 log = logging.getLogger("тестовый-t-one")
 MODEL_NAME = "sherpa-onnx-streaming-t-one-russian-2025-09-08"
@@ -22,26 +23,6 @@ TONE_RATE = 8000
 LEAD_SECONDS = .3
 TAIL_SECONDS = 1.0
 DELAY_SECONDS = .40
-
-
-def _lowpass():
-    n = np.arange(127) - 63
-    cutoff = 3800 / SAMPLE_RATE
-    kernel = 2 * cutoff * np.sinc(2 * cutoff * n) * np.blackman(127)
-    return (kernel / kernel.sum()).astype(np.float32)
-
-
-LOWPASS_8K = _lowpass()
-
-
-def to_8k(samples: np.ndarray) -> np.ndarray:
-    # Фильтр, тишина и поправка времени совпадают с интеграцией T-one
-    # в speech-monitor-gigaam. Сначала фильтрация, потом уменьшение частоты.
-    if samples.size == 0:
-        return samples.astype(np.float32)
-    # Для очень короткого входа np.convolve(mode='same') удлиняет массив.
-    filtered = np.convolve(samples, LOWPASS_8K, mode="full")[63:63 + len(samples)]
-    return np.ascontiguousarray(filtered[::2], dtype=np.float32)
 
 
 def word_tokens(tokens, timestamps, duration: float) -> tuple[list[str], list[float]]:

@@ -110,13 +110,17 @@ def prepare(args, conditions: dict) -> list[dict]:
 
 async def run_worker(request: dict) -> dict:
     directory = Path(request["output"])
-    task = directory / "tone-задание.json"
-    response = directory / "tone-ответ.json"
-    process_log = directory / "tone-процесс.log"
+    system = request.get("system", "tone")
+    if system not in {"tone", "tone_trt_greedy", "tone_trt_kenlm"}:
+        raise ValueError("Неизвестный рабочий процесс T-one")
+    module = "benchmark.tone_worker" if system == "tone" else "benchmark.tone_trt_worker"
+    task = directory / f"{system}-задание.json"
+    response = directory / f"{system}-ответ.json"
+    process_log = directory / f"{system}-процесс.log"
     save_json(task, request)
     started = time.perf_counter()
     process = await asyncio.create_subprocess_exec(sys.executable, "-X", "faulthandler",
-        "-m", "benchmark.tone_worker", str(task), start_new_session=True,
+        "-m", module, str(task), start_new_session=True,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
     async def capture():
@@ -140,8 +144,8 @@ async def run_worker(request: dict) -> dict:
         timed_out = True
     finally:
         await capture_task
-    prep_path = directory / "tone-подготовка.json"
-    preparation = json.loads(prep_path.read_text()) if prep_path.is_file() else {"system": "tone"}
+    prep_path = directory / f"{system}-подготовка.json"
+    preparation = json.loads(prep_path.read_text()) if prep_path.is_file() else {"system": system}
     if response.is_file() and not timed_out:
         payload = json.loads(response.read_text())
     else:

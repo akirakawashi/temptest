@@ -1,0 +1,30 @@
+# KenLM собирается в отдельном образе с компилятором; apt не используется.
+ARG TONE_BASE_IMAGE=speech-comparison:4.0.0-gigaam-cuda
+FROM python:3.12-bookworm AS kenlm-build
+RUN pip install --no-cache-dir cmake==3.31.6 setuptools==80.9.0 wheel==0.45.1 \
+ && pip wheel --no-cache-dir --no-deps --no-build-isolation kenlm==0.3.0 -w /wheels
+
+FROM ${TONE_BASE_IMAGE}
+USER root
+ARG TONE_REF=3c5b6c015038173840e62cea99e10cdb1c759116
+ARG TONE_SOURCE_SHA256=771a91608873daf0a7cb68f8fdc3dbb9bc029f2e14d3eea0985968f527d70f69
+COPY --from=kenlm-build /wheels /tmp/kenlm-wheels
+# Окружение меняется только в новом образе; прежние Whisper/GigaAM-образы сохранены.
+# numpy <2 нужен официальному pyctcdecode; CPU onnxruntime поверх CUDA не ставим.
+RUN pip install --only-binary=:all: numpy==1.26.4 av==15.1.0 \
+      huggingface-hub==0.36.2 'tritonclient[grpc]==2.59.0' pyctcdecode==0.5.0 \
+ && pip install --no-deps /tmp/kenlm-wheels/*.whl \
+ && curl -fL --retry 3 --connect-timeout 20 --max-time 300 \
+      "https://codeload.github.com/voicekit-team/T-one/tar.gz/${TONE_REF}" -o /tmp/tone-source.tar.gz \
+ && echo "${TONE_SOURCE_SHA256}  /tmp/tone-source.tar.gz" | sha256sum -c - \
+ && pip install --no-deps /tmp/tone-source.tar.gz \
+ && rm -rf /tmp/kenlm-wheels /tmp/tone-source.tar.gz
+COPY app /srv/app
+COPY benchmark /srv/benchmark
+WORKDIR /srv
+RUN python -m benchmark.audio_check \
+ && python -c 'import tone, kenlm, tritonclient.grpc; print("T-one: официальный пакет, KenLM и gRPC импортированы; модели/GPU не загружались")'
+USER app
+HEALTHCHECK NONE
+ENTRYPOINT ["python", "-m", "benchmark.tone_trt_run"]
+CMD []
