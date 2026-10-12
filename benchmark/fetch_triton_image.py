@@ -20,7 +20,9 @@ from urllib.parse import unquote, urlsplit
 
 TRITON_TAG = "nvcr.io/nvidia/tritonserver:25.06-py3"
 TRITON_SOURCE = "nvcr.io/nvidia/tritonserver@sha256:75bcfa5b0043898ece3e603c17a5bbbb1c9bddc390563db24312ef59d83735e5"
-SKOPEO_IMAGE = "quay.io/skopeo/stable@sha256:e5d5d2815b94d74767d40be7111647c3e9cdc84406a638ffe1c7ea1f286f52a3"
+# Digest тега v1.22.3-immutable. Тег latest пересобирается каждые несколько дней,
+# и его прежний digest пропадает из реестра; неизменяемый тег остаётся.
+SKOPEO_IMAGE = "quay.io/skopeo/stable@sha256:c0ee1f4edca5c01cb8d5611124f92f3cc47196ecab68aee5d0f90834e00574d5"
 PROXY_ENTRYPOINT = (
     'IFS= read -r HTTPS_PROXY || exit 2; '
     'HTTP_PROXY="$HTTPS_PROXY"; export HTTPS_PROXY HTTP_PROXY; '
