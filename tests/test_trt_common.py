@@ -24,7 +24,7 @@ def args_for(tmp_path, count=2):
             wav.setframerate(16000)
             wav.setsampwidth(2)
             wav.writeframes(np.zeros(16000, dtype="<i2").tobytes())
-    return trt_common.parser().parse_args([str(folder), "--out", str(output), "--expected-files", str(count), "--gap", "0"])
+    return trt_common.parser().parse_args([str(folder), "--out", str(output)])
 
 
 def fake_prepare(source, target, max_seconds=None):
@@ -38,12 +38,41 @@ def test_reference_reorders_and_rejects_wrong_corpus():
     files = [Path("a.wav"), Path("b.wav")]
     reference = {"records": [{"directory": "записи/0001", "audio": {"source": "/recordings/b.wav"}},
                              {"directory": "записи/0002", "audio": {"source": "/recordings/a.wav"}}]}
-    assert [p.name for p, _, _ in trt_common.reference_files(files, reference, 2)] == ["b.wav", "a.wav"]
-    with pytest.raises(ValueError):
-        trt_common.reference_files(files, reference, 100)
+    assert [p.name for p, _, _ in trt_common.reference_files(files, reference)] == ["b.wav", "a.wav"]
+    with pytest.raises(ValueError, match="не совпадают"):
+        trt_common.reference_files([*files, Path("c.wav")], reference)
+    with pytest.raises(ValueError, match="не совпадают"):
+        trt_common.reference_files(files[:1], reference)
     reference["records"][0]["directory"] = "../../outside"
     with pytest.raises(ValueError):
-        trt_common.reference_files(files, reference, 2)
+        trt_common.reference_files(files, reference)
+
+
+def test_any_number_of_records_is_accepted_and_empty_folder_is_not():
+    files = [Path(f"{index:04d}.wav") for index in range(3878)]
+    selected = trt_common.reference_files(files, None)
+    assert len(selected) == 3878 and selected[0][1] == "записи/0001" and selected[-1][1] == "записи/3878"
+    assert len({directory for _, directory, _ in selected}) == 3878
+    with pytest.raises(ValueError, match="нет аудиозаписей"):
+        trt_common.reference_files([], None)
+
+
+def test_removed_limits_are_not_accepted_as_parameters(tmp_path):
+    for flag in (["--expected-files", "100"], ["--gap", "5"]):
+        with pytest.raises(SystemExit):
+            trt_common.parser().parse_args([str(tmp_path), "--out", str(tmp_path), *flag])
+
+
+def test_summary_row_drops_per_record_details_and_keeps_what_reports_need():
+    result = {"status": "ok", "elapsed_seconds": 1.5, "asr_seconds": 1., "text": "Добрый день.", "error": None,
+              "stages": {"asr": {"seconds": 1., "calls": 1, "errors": 0}}, "timing": {"exclusive_wall_seconds": {}},
+              "trt_stages": {}, "triton_requests": 3, "triton_statistics_delta": {}, "pause_seconds": .5,
+              "stage_calls": [{}] * 1000, "speech_segments": [{}], "events": [{}], "utterances": [{}],
+              "raw_phrases": [{}], "pauses": [{}], "counters": {}}
+    row = trt_common.summary_row(result)
+    assert set(row) == {"status", "elapsed_seconds", "asr_seconds", "text", "error", "stages", "timing",
+                        "trt_stages", "triton_requests", "triton_statistics_delta", "pause_seconds"}
+    assert len(result["stage_calls"]) == 1000  # полный результат не меняется: он уходит в файл записи
 
 
 def test_changed_pcm_is_rejected_and_reference_stays_untouched(monkeypatch, tmp_path):

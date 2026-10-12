@@ -19,7 +19,7 @@ from benchmark.audio_check import decoder_info
 from benchmark.compare import Audio, host_info, setup_logging
 from benchmark.gigaam_trt_prepare import LABEL, MAX_FRAMES, MIN_FRAMES, SYSTEM, TRT_STAGES, vad_provider
 from benchmark.summary import write_summary
-from benchmark.trt_common import VAD_SETTINGS, parser, prepare, run_worker, save_json
+from benchmark.trt_common import VAD_SETTINGS, parser, prepare, run_worker, save_json, summary_row
 from benchmark.tone_trt_prepare import gpu_snapshot
 
 log = logging.getLogger("прогон-gigaam-trt")
@@ -92,7 +92,7 @@ async def run(args) -> int:
         "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(Path(__file__).parent.glob("*.py"))},
         "protocol": {"concurrency": 1, "batch_size": 1, "model_server_load_per_record": False,
-            "client_load_per_record": True, "warmup_per_record": True, "gap_seconds": args.gap,
+            "client_load_per_record": True, "warmup_per_record": True,
             "threads": args.threads, "timeout_seconds_per_phase": args.timeout,
             "rpc_timeout_seconds": min(args.timeout, 60),
             "preparation_included_in_measurements": False, "input": "mono PCM16 16000 Hz",
@@ -121,16 +121,14 @@ async def run(args) -> int:
                 "model_dir": str(args.model_dir), "vad_settings": conditions["vad_settings"],
                 "audio": asdict(row["audio"]), "warmup": conditions["warmup"]["audio"],
                 "output": str(args.out / row["directory"]), "log_dir": str(args.out), "protocol": conditions["protocol"]})
-            row[SYSTEM] = payload["result"]
+            result = payload["result"]
             conditions["preparations"].append({"directory": row["directory"], **payload["preparation"]})
-            save_json(args.out / row["directory"] / f"{SYSTEM}.json", row[SYSTEM])
-            (args.out / row["directory"] / f"{SYSTEM}.txt").write_text(row[SYSTEM].get("text", "") + "\n", encoding="utf-8")
+            save_json(args.out / row["directory"] / f"{SYSTEM}.json", result)
+            (args.out / row["directory"] / f"{SYSTEM}.txt").write_text(result.get("text", "") + "\n", encoding="utf-8")
+            row[SYSTEM] = summary_row(result)
             update(args.out, rows, conditions)
             if row[SYSTEM].get("preparation_failed") or "резерв" in str(row[SYSTEM].get("error")).lower():
                 raise RuntimeError(row[SYSTEM]["error"])
-            if index < len(rows) and args.gap:
-                log.info("Пауза %.1f с перед следующей записью — вне замеров", args.gap)
-                await asyncio.sleep(args.gap)
         code = int(any(row[SYSTEM]["status"] not in {"ok", "no_speech"} for row in rows))
         conditions["state"] = "Завершён с ошибками" if code else "Завершён"
     except (Exception, asyncio.CancelledError) as exc:
@@ -157,7 +155,7 @@ def finalize(output: Path, exit_code: int) -> None:
             row = {**record, "audio": Audio(**record["audio"])}
             path = output / row["directory"] / f"{SYSTEM}.json"
             if path.is_file():
-                row[SYSTEM] = json.loads(path.read_text(encoding="utf-8"))
+                row[SYSTEM] = summary_row(json.loads(path.read_text(encoding="utf-8")))
             rows.append(row)
         update(output, rows, conditions)
     shutil.rmtree(output / "временные", ignore_errors=True)
@@ -177,9 +175,8 @@ def main() -> int:
     cli = parser()
     cli.description = __doc__
     args = cli.parse_args()
-    if (min(args.expected_files, args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0
-            or not 0 <= args.gap <= 3600):
-        cli.error("Число файлов/потоков и времена положительные; пауза 0–3600 с")
+    if min(args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0:
+        cli.error("Число потоков и времена положительные")
     if args.threads != int(os.environ.get("BENCH_THREADS", str(args.threads))):
         cli.error("Число потоков задаётся через BENCH_THREADS")
     args.out.mkdir(parents=True, exist_ok=True)

@@ -90,7 +90,7 @@ def test_corpus_preparation_decodes_real_mp3_and_warmup_in_new_output_directory(
     output = tmp_path / "results"
     output.mkdir()
     assert not (output / "временные").exists()
-    args = trt_common.parser().parse_args([str(recordings), "--out", str(output), "--expected-files", "2"])
+    args = trt_common.parser().parse_args([str(recordings), "--out", str(output)])
     monkeypatch.setattr(compare.shutil, "which", lambda name: None)
     conditions = {"records": [], "vad_settings": dict(trt_common.VAD_SETTINGS)}
     rows = trt_common.prepare(args, conditions)

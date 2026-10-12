@@ -219,8 +219,7 @@ def args_for(tmp_path, without_kenlm=False):
     (cache / "движок.json").write_text(json.dumps({"fingerprint": {"gpu": {"uuid": "GPU-1"}}}))
     (cache / "артефакты.json").write_text("{}")
     from benchmark.trt_common import parser
-    args = parser().parse_args([str(audio), "--out", str(output), "--model-dir", str(cache),
-                               "--expected-files", "2", "--gap", "0"])
+    args = parser().parse_args([str(audio), "--out", str(output), "--model-dir", str(cache)])
     args.without_kenlm = without_kenlm
     return args
 

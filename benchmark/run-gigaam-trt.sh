@@ -23,6 +23,8 @@ while (( $# )); do
             shift 2 ;;
         --out|--model-dir|--finalize|--out=*|--model-dir=*|--finalize=*)
             echo 'Папки модели и результатов задаются стендом' >&2; exit 2 ;;
+        --gap|--gap=*|--expected-files|--expected-files=*)
+            echo "$1 больше нет: обрабатываются все записи папки, пауз между ними нет" >&2; exit 2 ;;
         *) TRT_ARGS+=("$1"); shift ;;
     esac
 done

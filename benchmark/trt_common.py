@@ -20,6 +20,8 @@ log = logging.getLogger("прогон-tensorrt")
 VAD_SETTINGS = {"vad_threshold": .5, "vad_min_silence": .45, "vad_min_speech": .25, "vad_max_speech": 15.}
 WORKERS = {"tone_trt_greedy": "benchmark.tone_trt_worker", "tone_trt_kenlm": "benchmark.tone_trt_worker",
            "gigaam_trt": "benchmark.gigaam_trt_worker"}
+# Подробности записи лежат в её файле; сводке и отчёту они не нужны, а на тысячах записей занимают гигабайты памяти.
+HEAVY = ("stage_calls", "speech_segments", "events", "utterances", "raw_phrases", "pauses", "counters")
 
 
 def save_json(path: Path, value):
@@ -28,17 +30,19 @@ def save_json(path: Path, value):
     temporary.replace(path)
 
 
-def reference_files(files: list[Path], reference: dict | None, expected: int):
-    if len(files) != expected:
-        raise ValueError(f"Найдено {len(files)} аудиозаписей, ожидалось {expected}; распознавание не начиналось")
+def summary_row(result: dict) -> dict:
+    return {key: value for key, value in result.items() if key not in HEAVY}
+
+
+def reference_files(files: list[Path], reference: dict | None):
+    if not files:
+        raise ValueError("В папке нет аудиозаписей; распознавание не начиналось")
     if reference is None:
         return [(source, f"записи/{i:04d}", None) for i, source in enumerate(files, 1)]
     records = reference.get("records", [])
-    if len(records) != expected:
-        raise ValueError("В исходном прогоне другое число записей")
     names = {p.name: p for p in files}
     old_names = [Path(r["audio"]["source"]).name for r in records]
-    if len(names) != expected or len(set(old_names)) != expected or set(old_names) != set(names):
+    if len(names) != len(files) or len(set(old_names)) != len(records) or set(old_names) != set(names):
         raise ValueError("Имена записей нового и исходного прогонов не совпадают либо повторяются")
     result, directories = [], set()
     for record, name in zip(records, old_names):
@@ -68,7 +72,7 @@ def prepare(args, conditions: dict) -> list[dict]:
             conditions["vad_settings"] = {key: settings[key] for key in VAD_SETTINGS}
             if settings.get("asr_threads", args.threads) != args.threads:
                 raise ValueError("Число потоков отличается от исходного GigaAM; установите BENCH_THREADS как в исходном прогоне")
-    selected = reference_files(files, reference, args.expected_files)
+    selected = reference_files(files, reference)
     (args.out / "временные").mkdir(parents=True, exist_ok=True)
     rows = []
     for index, (source, directory, old) in enumerate(selected, 1):
@@ -166,10 +170,8 @@ def parser():
     cli.add_argument("--out", type=Path, required=True)
     cli.add_argument("--reference-run", type=Path)
     cli.add_argument("--model-dir", type=Path, default=Path("/cache"))
-    cli.add_argument("--expected-files", type=int, default=int(os.environ.get("BENCH_EXPECTED_FILES", "100")))
     cli.add_argument("--threads", type=int, default=int(os.environ.get("BENCH_THREADS", "4")))
     cli.add_argument("--timeout", type=int, default=3600)
-    cli.add_argument("--gap", type=float, default=5.)
     cli.add_argument("--warmup-file", type=Path)
     cli.add_argument("--warmup-seconds", type=float, default=30.)
     cli.add_argument("--max-audio-seconds", type=float, default=1800.)

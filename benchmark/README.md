@@ -8,7 +8,8 @@
 | GigaAM v3 через TensorRT | `run-gigaam-trt.sh` | `speech-comparison-gigaam-trt` | [GIGAAM-TRT.md](GIGAAM-TRT.md) |
 | T-one через TensorRT | `run-tone-trt.sh` | `speech-comparison-tone-trt` | [TONE-TRT.md](TONE-TRT.md) |
 
-Порядок файлов одинаковый, один файл за раз, между записями пауза (по умолчанию 5 с).
+Порядок файлов одинаковый, один файл за раз. Тесты TensorRT обрабатывают все записи папки подряд, без пауз.
+Whisper ждёт ровно 100 записей (`--expected-files`) и делает паузу 5 с между запросами.
 Продовые контейнеры и их API не используются. Запуск на GPU выполняет владелец;
 локальные проверки используют заглушки без моделей и реальных запросов.
 Команды для H100 — [SERVER.md](SERVER.md).

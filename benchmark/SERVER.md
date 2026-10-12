@@ -105,6 +105,7 @@ BENCH_GPU=0 BENCH_GPU_MIN_FREE_MIB=12288 BENCH_GPU_MAX_UTIL=100 BENCH_GPU_RESERV
   bash benchmark/run-tone-trt.sh ../audio
 ```
 
+Оба теста обрабатывают все записи папки подряд, без пауз; число записей не ограничено.
 Подготовка, замеры и файлы результатов — в [GIGAAM-TRT.md](GIGAAM-TRT.md) и
 [TONE-TRT.md](TONE-TRT.md). `--reference-run benchmark-results/<прогон>` сверяет
 корпус с прежним прогоном. Если `nvcr.io` отвечает 403, образ Triton загружается

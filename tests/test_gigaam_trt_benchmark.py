@@ -312,7 +312,7 @@ def args_for(tmp_path):
     (cache / "движок.json").write_text(json.dumps({"fingerprint": {"gpu": {"uuid": "GPU-1"}}}))
     (cache / "артефакты.json").write_text("{}")
     from benchmark.trt_common import parser
-    return parser().parse_args([str(audio), "--out", str(output), "--model-dir", str(cache), "--expected-files", "2", "--gap", "0"])
+    return parser().parse_args([str(audio), "--out", str(output), "--model-dir", str(cache)])
 
 
 @pytest.mark.parametrize("fail_first", [False, True])
@@ -330,6 +330,7 @@ def test_corpus_keeps_results_reports_and_pending_files(monkeypatch, tmp_path, f
         result = {"status": "error" if failed else "ok", "text": "Добрый день.", "elapsed_seconds": .4, "asr_seconds": .2,
             "error": "load failure" if failed else None, "preparation_failed": failed, "stages": stages,
             "pause_seconds": .5, "triton_requests": 1,
+            "utterances": [{"text": "Добрый день.", "start": 0., "end": 1.}], "stage_calls": [{"stage": "asr"}],
             "timing": {"exclusive_wall_seconds": {"vad": .1, "asr": .1, "parallel": .2, "other": 0},
                        "exclusive_wall_percent": {"vad": 25., "asr": 25., "parallel": 50., "other": 0.}},
             "trt_stages": {key: {"seconds": .05, "calls": 1, "errors": 0} for key in preparation.TRT_STAGES}}
@@ -342,7 +343,11 @@ def test_corpus_keeps_results_reports_and_pending_files(monkeypatch, tmp_path, f
     entry = summary["systems"]["gigaam_trt"]
     assert conditions["mode"] == "gigaam_tensorrt" and conditions["vad_provider"] == "cpu"
     assert conditions["protocol"]["disabled_stages"] == ["speaker", "emotion", "llm"]
+    assert "gap_seconds" not in conditions["protocol"]
     assert entry["label"] == "GigaAM TensorRT"
+    # Файл записи хранит подробности целиком, хотя в памяти прогона остаётся только нужное сводке.
+    saved = json.loads((args.out / "записи/0001/gigaam_trt.json").read_text())
+    assert saved["utterances"] and saved["stage_calls"]
     if fail_first:
         assert calls == ["gigaam_trt"] and entry["statuses"]["pending"] == 1 and conditions["state"].startswith("Остановлен")
     else:
@@ -475,7 +480,7 @@ if args[0]=='logs': print('Журнал нашего контейнера',flush
         "BENCH_GPU_MAX_UTIL": "100", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
     env.pop("BENCH_VAD_PROVIDER", None)
     env.pop("BENCH_GPU_MIN_FREE_MIB", None)
-    launched = subprocess.run(["bash", str(ROOT / "benchmark/run-gigaam-trt.sh"), str(audio), "--expected-files", "2"],
+    launched = subprocess.run(["bash", str(ROOT / "benchmark/run-gigaam-trt.sh"), str(audio), "--max-audio-seconds", "7200"],
         env=env, capture_output=True, text=True, timeout=30)
     expected = 42 if free_mib < 12288 else 1 if not image_cached else client_code
     assert launched.returncode == expected, launched.stdout + launched.stderr
@@ -504,5 +509,17 @@ if args[0]=='logs': print('Журнал нашего контейнера',flush
     assert all(cmd[cmd.index("-f") + 1].endswith("compose.gigaam-trt-benchmark.yml" if cmd[-1] == "client" else "compose.trt-base.yml") for cmd in builds)
     assert all("--pull" in cmd and cmd[cmd.index("--pull") + 1] == "never" for cmd in runs)
     client = runs[-1]
-    assert client[-4:] == ["--out", "/results", "--expected-files", "2"] and "/recordings" in client
+    assert client[-4:] == ["--out", "/results", "--max-audio-seconds", "7200"] and "/recordings" in client
     assert "поиск речи: cpu" in launched.stdout
+
+
+@pytest.mark.parametrize("script", ["run-gigaam-trt.sh", "run-tone-trt.sh"])
+@pytest.mark.parametrize("flag", [["--gap", "1"], ["--expected-files", "3878"], ["--gap=0"]])
+def test_launchers_refuse_removed_limits_before_touching_docker(tmp_path, script, flag):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    env = {**os.environ, "BENCH_OUT": str(tmp_path / "results"), "BENCH_CACHE": str(tmp_path / "cache")}
+    refused = subprocess.run(["bash", str(ROOT / "benchmark" / script), str(audio), *flag],
+        env=env, capture_output=True, text=True, timeout=15)
+    assert refused.returncode == 2 and "больше нет" in refused.stderr
+    assert not (tmp_path / "results").exists() and not (tmp_path / "cache").exists()
