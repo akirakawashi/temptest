@@ -131,7 +131,7 @@ class WhisperAPI:
                 text = text.replace(self.key, "[КЛЮЧ СКРЫТ]")
             if response.status_code != 200:
                 result["response_error"] = text
-                raise RuntimeError(f"HTTP {response.status_code}; последующие запросы и GigaAM остановлены")
+                raise RuntimeError(f"HTTP {response.status_code}; последующие запросы остановлены")
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError:

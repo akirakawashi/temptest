@@ -192,9 +192,9 @@ else
     fi
 fi
 if ! docker image inspect speech-comparison:4.0.0-gigaam-cuda >/dev/null 2>&1; then
-    echo 'Собираем библиотечный CUDA-образ прежнего стенда; сервисы не запускаются.'
-    docker compose --project-name speech-comparison-tone-trt -f "$TRT_PROJECT_DIR/compose.benchmark.yml" \
-        --progress plain build compare
+    echo 'Собираем общий образ библиотек TensorRT-клиентов; сервисы не запускаются.'
+    docker compose --project-name speech-comparison-tone-trt -f "$TRT_PROJECT_DIR/compose.trt-base.yml" \
+        --progress plain build base
 fi
 trt_compose --progress plain build client
 docker image inspect speech-comparison:2.0.0-tone-trt-client "$TRT_IMAGE" \

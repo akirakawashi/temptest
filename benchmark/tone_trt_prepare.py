@@ -14,7 +14,7 @@ import time
 import urllib.request
 
 from benchmark.compare import setup_logging
-from benchmark.tone_run import save_json
+from benchmark.trt_common import save_json
 
 log = logging.getLogger("подготовка-t-one-trt")
 TONE_REF = "3c5b6c015038173840e62cea99e10cdb1c759116"

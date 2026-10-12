@@ -10,7 +10,7 @@ from types import ModuleType
 import numpy as np
 import pytest
 
-from benchmark import audio_check, compare, tone_run
+from benchmark import audio_check, compare, trt_common
 
 
 @pytest.fixture
@@ -76,7 +76,7 @@ def test_build_check_does_not_hide_incompatible_open_keyword(monkeypatch):
         audio_check.check_decoder()
 
 
-def test_tone_prepares_real_mp3_corpus_and_warmup_in_new_output_directory(native_decoder, tmp_path, monkeypatch):
+def test_corpus_preparation_decodes_real_mp3_and_warmup_in_new_output_directory(native_decoder, tmp_path, monkeypatch):
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         pytest.skip("ffmpeg нужен только для создания синтетического MP3 в тесте")
@@ -90,10 +90,10 @@ def test_tone_prepares_real_mp3_corpus_and_warmup_in_new_output_directory(native
     output = tmp_path / "results"
     output.mkdir()
     assert not (output / "временные").exists()
-    args = tone_run.parser().parse_args([str(recordings), "--out", str(output), "--expected-files", "2"])
+    args = trt_common.parser().parse_args([str(recordings), "--out", str(output), "--expected-files", "2"])
     monkeypatch.setattr(compare.shutil, "which", lambda name: None)
-    conditions = {"records": [], "vad_settings": dict(tone_run.VAD_SETTINGS)}
-    rows = tone_run.prepare(args, conditions)
+    conditions = {"records": [], "vad_settings": dict(trt_common.VAD_SETTINGS)}
+    rows = trt_common.prepare(args, conditions)
     assert len(rows) == len(conditions["records"]) == 2
     assert {row["audio"].source_channels for row in rows} == {1, 2}
     assert len(list((output / "временные").glob("*.wav"))) == 3

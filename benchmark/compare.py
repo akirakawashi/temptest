@@ -1,10 +1,10 @@
-"""Каждая запись: Whisper (текст) и GigaAM (полный цикл). Запуск — вручную."""
+"""Корпус через собственный тестовый Whisper; подготовка звука общая для всех тестов стенда."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import csv
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
@@ -13,9 +13,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import signal
 import subprocess
-import sys
 import time
 import wave
 
@@ -23,7 +21,7 @@ import wave
 FORMATS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".mp4", ".wma"}
 STATUS = {
     "ok": "Успешно", "error": "Ошибка", "timeout": "Превышено время",
-    "no_speech": "Речь не найдена; LLM не запускалась", "pending": "Не запускался",
+    "no_speech": "Речь не найдена", "pending": "Не запускался",
 }
 log = logging.getLogger("сравнение")
 
@@ -96,7 +94,7 @@ def source_audio_info(source: Path) -> tuple[int | None, int | None]:
 
 
 def prepare_audio(source: Path, target: Path, *, max_seconds: float | None = None) -> Audio:
-    """Единый WAV для обеих систем; преобразование не входит в их таймеры."""
+    """Единый WAV для всех систем; преобразование не входит в их таймеры."""
     started = time.perf_counter()
     source_channels, source_rate = source_audio_info(source)
     command = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(source), "-vn"]
@@ -147,10 +145,6 @@ def read_audio(audio: Audio):
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
 
-def system_order(index: int) -> tuple[str, str]:
-    return ("whisper", "gigaam") if index % 2 == 0 else ("gigaam", "whisper")
-
-
 def host_info() -> dict:
     result = {
         "platform": platform.platform(), "machine": platform.machine(), "python": platform.python_version(),
@@ -174,201 +168,79 @@ def host_info() -> dict:
 
 
 def csv_row(row: dict) -> dict:
-    audio = row["audio"]
-    whisper, giga, first = (row.get(s, {}) for s in ("whisper", "gigaam", "gigaam_first_line"))
-    duration = audio.seconds
+    audio, whisper = row["audio"], row.get("whisper", {})
 
     def number(value):
         return "" if value is None else f"{value:.6f}".replace(".", ",")
 
-    def ratio(result, field):
-        value = result.get(field)
-        return number(value / duration) if result.get("status") == "ok" and value is not None else ""
-
+    elapsed = whisper.get("elapsed_seconds")
     return {
         "Запись": audio.source,
-        "Длительность, с": number(duration), "Общая подготовка, с": number(audio.preparation_seconds),
-        "Порядок": " → ".join(row["order"]),
-        "Whisper, с": number(whisper.get("elapsed_seconds")),
+        "Длительность, с": number(audio.seconds), "Общая подготовка, с": number(audio.preparation_seconds),
+        "Whisper, с": number(elapsed),
         "Whisper — сегменты с текстом, с": number(whisper.get("speech_seconds")),
         "Whisper — HTTP": whisper.get("http_status", ""),
         "Whisper — попыток": whisper.get("attempts", ""),
-        "GigaAM распознавание, с": number(giga.get("asr_seconds")),
-        "GigaAM полностью, с": number(giga.get("elapsed_seconds")),
-        "GigaAM VAD, с": number(giga.get("stages", {}).get("vad", {}).get("seconds")),
-        "GigaAM CAM++, с": number(giga.get("stages", {}).get("speaker", {}).get("seconds")),
-        "GigaAM эмоции, с": number(giga.get("stages", {}).get("emotion", {}).get("seconds")),
-        "GigaAM LLM, с": number(giga.get("llm_seconds")),
-        "Первая линия полностью, с": number(first.get("elapsed_seconds")),
-        "Первая линия ASR, с": number(first.get("asr_seconds")),
-        "Первая линия VAD, с": number(first.get("stages", {}).get("vad", {}).get("seconds")),
-        "Первая линия — паузы, с": number(first.get("pause_seconds")),
-        "Первая линия — статус": STATUS[first.get("status", "pending")],
-        "Whisper / длительность": ratio(whisper, "elapsed_seconds"),
-        "GigaAM распознавание / длительность": ratio(giga, "asr_seconds"),
-        "GigaAM полностью / длительность": ratio(giga, "elapsed_seconds"),
+        "Whisper / длительность": number(elapsed / audio.seconds) if whisper.get("status") == "ok" and elapsed is not None else "",
         "Whisper — статус": STATUS[whisper.get("status", "pending")],
-        "GigaAM — статус": STATUS[giga.get("status", "pending")],
-        "LLM — текст сокращён": "да" if (giga.get("analysis") or {}).get("truncated") else "нет" if giga.get("analysis") else "",
-        "LLM — загрузка в замере, с": number((giga.get("analysis") or {}).get("load_sec")),
-        "Причина": "; ".join(r["error"] for r in (whisper, giga, first) if r.get("error")),
+        "Причина": whisper.get("error") or "",
         "Результаты": row["directory"],
     }
 
 
-def save_reports(output: Path, rows: list[dict], state: str, *, mode: str | None = None) -> None:
-    gigaam_only = mode == "gigaam-only"
+def save_reports(output: Path, rows: list[dict], state: str) -> None:
     if rows:
         csv_rows = [csv_row(row) for row in rows]
         with (output / "сводка.csv").open("w", encoding="utf-8-sig", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=list(csv_rows[0]), delimiter=";")
             writer.writeheader()
             writer.writerows(csv_rows)
-    pairs = [row for row in rows if all(row.get(s, {}).get("status") == "ok" for s in ("whisper", "gigaam"))]
-    measured = [row for row in rows if row.get("gigaam", {}).get("status") == "ok"] if gigaam_only else pairs
-    api_mode = mode in {"api", "standalone-api"} or any(row.get("whisper", {}).get("mode") in {"existing_server_api", "test_server_api"} for row in rows)
-    standalone = mode == "standalone-api" or any(row.get("whisper", {}).get("mode") == "test_server_api" for row in rows)
-    lines = ["# Сравнение Whisper и полного цикла GigaAM", "", f"Состояние прогона: **{state}**.", "",
-             "Одна NVIDIA GPU, один файл за раз. У GigaAM в полный цикл входят VAD, распознавание, голоса, эмоции и LLM.",
-             "Общая подготовка, загрузка моделей, прогрев и запись отчётов исключены из замеров.",
-             "Whisper — faster-whisper large-v3 на CUDA/float16 (если модель не изменена параметром запуска).",
-             "GigaAM ASR — официальный v3_e2e_rnnt, CUDA, fp16 encoder / fp32 head.",
-             "Каждый замер выполняется в отдельном процессе после прогрева; другая система выгружена из GPU.", "",
-             f"Записей в корпусе: {len(rows)}. Полностью успешных пар: {len(pairs)}.", "",
-             "| Запись | Аудио, с | Whisper, с | GigaAM ASR, с | GigaAM всё, с | Статус Whisper / GigaAM |",
-             "|---|---:|---:|---:|---:|---|"]
-    if gigaam_only:
-        replacements = {
-            "# Сравнение Whisper и полного цикла GigaAM": "# Полный цикл GigaAM",
-            "Whisper — faster-whisper large-v3 на CUDA/float16 (если модель не изменена параметром запуска).":
-                "Whisper в этом прогоне не запускается. Его прежние результаты сохраняются отдельно; вход сопоставляется по имени и SHA256 PCM.",
-            "Каждый замер выполняется в отдельном процессе после прогрева; другая система выгружена из GPU.":
-                "Каждый замер GigaAM выполняется в отдельном процессе после загрузки моделей и прогрева. GPU общая с рабочими сервисами.",
-            f"Записей в корпусе: {len(rows)}. Полностью успешных пар: {len(pairs)}.":
-                f"Записей в корпусе: {len(rows)}. Успешных результатов GigaAM: {len(measured)}.",
-            "| Запись | Аудио, с | Whisper, с | GigaAM ASR, с | GigaAM всё, с | Статус Whisper / GigaAM |":
-                "| Запись | Аудио, с | GigaAM ASR, с | GigaAM всё, с | Статус GigaAM |",
-            "|---|---:|---:|---:|---:|---|": "|---|---:|---:|---:|---|",
-        }
-        lines = [replacements.get(line, line) for line in lines]
-
-    def fmt(result, key):
-        value = result.get(key)
-        return "—" if value is None else f"{value:.3f}"
-
+    measured = [row for row in rows if row.get("whisper", {}).get("status") == "ok"]
+    lines = ["# Whisper на корпусе записей", "", f"Состояние прогона: **{state}**.", "",
+             "Одна NVIDIA GPU, один файл за раз. Подготовка звука, загрузка модели, прогрев и запись отчётов исключены из замеров.",
+             "Whisper — собственная копия закреплённого образа рабочего сервиса; модель CUDA/float16 и фактические версии проверены через API.",
+             "Время — весь HTTP-запрос: передача WAV, обработка и получение ответа. Чистое время распознавания сервер не сообщает.",
+             "Тестовый Whisper использует штатный VAD образа; распознавание — GPU, подготовка звука и часть вспомогательных операций — CPU.",
+             "Продовые контейнеры и их API не используются. GPU общая: посторонняя нагрузка влияет на результат.", "",
+             f"Записей в корпусе: {len(rows)}. Успешных: {len(measured)}.", "",
+             "| Запись | Аудио, с | Whisper, с | Статус |",
+             "|---|---:|---:|---|"]
     for row in rows:
-        w, g = row.get("whisper", {}), row.get("gigaam", {})
+        whisper = row.get("whisper", {})
         name = Path(row["audio"].source).name.replace("|", "\\|").replace("\n", " ")
-        status = f"{STATUS[w.get('status', 'pending')]} / {STATUS[g.get('status', 'pending')]}"
-        if gigaam_only:
-            lines.append(f"| [{name}]({row['directory']}/) | {row['audio'].seconds:.3f} | "
-                         f"{fmt(g, 'asr_seconds')} | {fmt(g, 'elapsed_seconds')} | {STATUS[g.get('status', 'pending')]} |")
-        else:
-            lines.append(f"| [{name}]({row['directory']}/) | {row['audio'].seconds:.3f} | {fmt(w, 'elapsed_seconds')} | "
-                         f"{fmt(g, 'asr_seconds')} | {fmt(g, 'elapsed_seconds')} | {status} |")
+        elapsed = whisper.get("elapsed_seconds")
+        lines.append(f"| [{name}]({row['directory']}/) | {row['audio'].seconds:.3f} | "
+                     f"{'—' if elapsed is None else f'{elapsed:.3f}'} | {STATUS[whisper.get('status', 'pending')]} |")
     if measured:
+        seconds = sum(row["whisper"]["elapsed_seconds"] for row in measured)
         audio_seconds = sum(row["audio"].seconds for row in measured)
-        lines.extend(["", "Итоги только по успешным результатам GigaAM:" if gigaam_only else "Итоги только по полностью успешным парам:", ""])
-        metrics = [("GigaAM — распознавание", "gigaam", "asr_seconds"), ("GigaAM — полный цикл", "gigaam", "elapsed_seconds")]
-        if not gigaam_only:
-            metrics.insert(0, ("Whisper", "whisper", "elapsed_seconds"))
-        for title, system, key in metrics:
-            elapsed = sum(row[system][key] for row in measured)
-            lines.append(f"- {title}: {elapsed:.3f} с; время / длительность аудио = {elapsed / audio_seconds:.4f}.")
-    lines.extend(["", "Времена строк с ошибкой — время до отказа, они не входят в итоговое сравнение.",
-                  "Времена отдельных этапов GigaAM могут пересекаться: их сумма не равна полному времени.",
+        lines.extend(["", "Итог только по успешным записям:", "",
+                      f"- Whisper: {seconds:.3f} с; среднее {seconds / len(measured):.3f} с; "
+                      f"время / длительность аудио = {seconds / audio_seconds:.4f}; "
+                      f"за 15 минут ≈ {900 * len(measured) / seconds:.1f} записей этого корпуса."])
+    lines.extend(["", "Время строки с ошибкой — время до отказа, в итог оно не входит.",
                   "Подробный журнал — `прогон.log`, параметры и версии — `условия.json`, таблица — `сводка.csv`.", ""])
-    if api_mode:
-        lines[lines.index("Whisper — faster-whisper large-v3 на CUDA/float16 (если модель не изменена параметром запуска).")] = (
-            "Whisper — существующий сервис через API; модель и доступные сведения /health записаны в условия.json.")
-        lines[lines.index("Каждый замер выполняется в отдельном процессе после прогрева; другая система выгружена из GPU.")] = (
-            "Whisper: существующий сервис через API, его модель остаётся в GPU; затем весь корпус GigaAM в отдельных процессах.")
-        lines.extend(["Whisper — время HTTP-запроса, включая загрузку WAV, очередь, распознавание и получение ответа.",
-                      "Встроенные параметры и провайдер VAD рабочего Whisper стенд не меняет и не определяет по /health.",
-                      "Прогрев GigaAM исключён; дополнительного распознавания для прогрева рабочего Whisper нет.",
-                      "Это сравнение рабочего сервиса с локальным полным конвейером. Посторонняя нагрузка и порядок фаз влияют на результат.", ""])
-    if standalone:
-        replacements = {
-            "Whisper — существующий сервис через API; модель и доступные сведения /health записаны в условия.json.":
-                "Whisper — собственная копия закреплённого образа рабочего сервиса; модель CUDA/float16 и фактические версии проверены через API.",
-            "Whisper: существующий сервис через API, его модель остаётся в GPU; затем весь корпус GigaAM в отдельных процессах.":
-                "Весь корпус Whisper после прогрева; затем тестовый Whisper остановлен, весь корпус GigaAM в отдельных процессах. Контейнеры сохраняются.",
-            "Встроенные параметры и провайдер VAD рабочего Whisper стенд не меняет и не определяет по /health.":
-                "Тестовый Whisper использует штатный VAD образа; распознавание — GPU, подготовка звука и часть вспомогательных операций — CPU.",
-            "Прогрев GigaAM исключён; дополнительного распознавания для прогрева рабочего Whisper нет.":
-                "Загрузка моделей и прогрев обеих систем исключены из измеряемых времён; GigaAM ASR измеряется отдельно от полного цикла.",
-            "Это сравнение рабочего сервиса с локальным полным конвейером. Посторонняя нагрузка и порядок фаз влияют на результат.":
-                "Продовые контейнеры и их API не используются. GPU общая: посторонняя нагрузка и порядок фаз влияют на результат.",
-        }
-        lines = [replacements.get(line, line) for line in lines]
-    if any("gigaam_first_line" in row["order"] for row in rows):
-        completed = [r for r in rows if all(r.get(s, {}).get("status") == "ok" for s in ("whisper", "gigaam", "gigaam_first_line"))]
-        lines.extend(["", "## GigaAM для первой линии — отдельный измеренный прогон", "",
-                      "Только VAD и ASR; без CAM++, эмоций и GigaChat. Все три режима читают тот же моно WAV.",
-                      "Роли по исходным каналам не восстанавливаются; паузы — оценка VAD.",
-                      f"Полностью успешных троек: {len(completed)} из {len(rows)}.", "",
-                      "| Запись | Первая линия ASR, с | Первая линия полностью, с | Статус |",
-                      "|---|---:|---:|---|"])
-        for row in rows:
-            first = row.get("gigaam_first_line", {})
-            lines.append(f"| {Path(row['audio'].source).name.replace('|', ' ')} | {fmt(first, 'asr_seconds')} | "
-                         f"{fmt(first, 'elapsed_seconds')} | {STATUS[first.get('status', 'pending')]} |")
-        if completed:
-            lines.append("")
-            for system, label in (("whisper", "Whisper"), ("gigaam", "GigaAM полностью"), ("gigaam_first_line", "Первая линия")):
-                seconds = sum(r[system]["elapsed_seconds"] for r in completed)
-                lines.append(f"- {label}: {seconds:.3f} с; среднее {seconds / len(completed):.3f} с; "
-                             f"за 15 минут ≈ {900 * len(completed) / seconds:.1f} записей этого корпуса.")
     (output / "отчёт.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def save_result(output: Path, row: dict, system: str, result: dict) -> None:
+def save_result(output: Path, row: dict, result: dict) -> None:
     directory = output / row["directory"]
-    write_json(directory / f"{system}.json", result)
-    (directory / f"{system}.txt").write_text(result.get("text", "") + "\n", encoding="utf-8")
+    write_json(directory / "whisper.json", result)
+    (directory / "whisper.txt").write_text(result.get("text", "") + "\n", encoding="utf-8")
     elapsed = result.get("elapsed_seconds")
-    log.info("%s: %s; время %s", system, STATUS[result["status"]],
+    log.info("Whisper: %s; время %s", STATUS[result["status"]],
              "не измерено" if elapsed is None else f"{elapsed:.3f} с")
     if result.get("error"):
         log.error("%s", result["error"])
     if result.get("response_error"):
         log.error("Whisper — ответ при ошибке:\n%s", result["response_error"])
-    if system in {"gigaam", "gigaam_first_line"}:
-        STAGES = {"vad": "Выделение речи", "asr": "Распознавание речи", "speaker": "Разделение собеседников", "emotion": "Определение эмоций"}
-
-        for stage, values in result.get("stages", {}).items():
-            log.info("GigaAM — %s: %.6f с, вызовов %d, ошибок %d", STAGES[stage], values["seconds"], values["calls"], values["errors"])
-        log.info("%s — включённые этапы: %s; разбор LLM: %.6f с", system,
-                 result.get("enabled_stages"), result.get("llm_seconds", 0))
-        log.info("%s — распределение времени: %s; счётчики: %s", system, result.get("timing"), result.get("counters"))
-        log.info("%s — интервалы пауз VAD: %s", system, result.get("pauses"))
-        for call in result.get("stage_calls", []):
-            log.info("GigaAM — вызов модели: %s", json.dumps(call, ensure_ascii=False))
-        emotions = {"angry": "раздражение", "sad": "грусть", "neutral": "нейтрально", "positive": "позитив"}
-        for utterance in result.get("utterances", []):
-            emotion = utterance.get("emotion") or {}
-            log.info("GigaAM — реплика %d, %.2f–%.2f с, собеседник %s, эмоция: %s: %s",
-                     utterance["id"], utterance["start"], utterance["end"], utterance["speaker"],
-                     emotions.get(emotion.get("label"), "не определена"), utterance["text"])
-        for event in result.get("events", []):
-            if event["type"] == "error":
-                log.error("GigaAM — событие ошибки: %s", event["message"])
-            elif event["type"] == "relabel":
-                log.info("GigaAM — объединены собеседники %s → %s", event["from"], event["to"])
-        analysis = result.get("analysis") or {}
-        if analysis.get("result"):
-            log.info("GigaAM — результат разбора LLM:\n%s", json.dumps(analysis["result"], ensure_ascii=False, indent=2))
-        if analysis.get("truncated"):
-            log.warning("GigaAM — середина разговора сокращена для контекста LLM; это отмечено в сводке")
-    else:
-        log.info("Whisper — текст:\n%s", result.get("text", ""))
-        for segment in result.get("segments", []):
-            log.info("Whisper — сегмент: %s", json.dumps(segment, ensure_ascii=False))
-            if isinstance(segment, dict) and isinstance(segment.get("compression_ratio"), (int, float)) and segment["compression_ratio"] > 2.4:
-                log.warning("Whisper — высокая повторяемость текста: compression_ratio=%s; нужна проверка аудио", segment["compression_ratio"])
-        if result.get("mode") in {"existing_server_api", "test_server_api"}:
-            log.info("Whisper API — HTTP %s, попыток %s, найденные сегменты %.3f с, ответ %s байт; чистое ASR-время сервер не сообщал",
-                     result.get("http_status"), result.get("attempts"), result.get("speech_seconds", 0), result.get("response_bytes"))
+    log.info("Whisper — текст:\n%s", result.get("text", ""))
+    for segment in result.get("segments", []):
+        log.info("Whisper — сегмент: %s", json.dumps(segment, ensure_ascii=False))
+        if isinstance(segment, dict) and isinstance(segment.get("compression_ratio"), (int, float)) and segment["compression_ratio"] > 2.4:
+            log.warning("Whisper — высокая повторяемость текста: compression_ratio=%s; нужна проверка аудио", segment["compression_ratio"])
+    log.info("Whisper API — HTTP %s, попыток %s, найденные сегменты %.3f с, ответ %s байт; чистое ASR-время сервер не сообщал",
+             result.get("http_status"), result.get("attempts"), result.get("speech_seconds", 0), result.get("response_bytes"))
 
 
 def positive_int(value: str) -> int:
@@ -382,16 +254,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--audio-dir", type=Path, required=True, help="Папка записей; вложенные папки тоже обрабатываются")
     result.add_argument("--out", type=Path, default=Path("benchmark-results") / datetime.now().strftime("%Y%m%d-%H%M%S-%f"), help="Новая папка отчёта")
-    result.add_argument("--threads", type=positive_int, default=int(os.environ.get("BENCH_THREADS", "4")), help="Потоки CPU для подготовки и вспомогательных операций")
-    result.add_argument("--whisper-model", default="large-v3", help="Модель faster-whisper или локальный путь к весам")
-    result.add_argument("--whisper-cache", default="/cache/whisper")
-    result.add_argument("--beam-size", type=positive_int, default=5)
-    result.add_argument("--timeout", type=positive_int, default=3600, help="Максимальное ожидание подготовки и одного прогона, секунды")
     result.add_argument("--warmup-file", type=Path, help="Отдельная запись с речью для прогрева; по умолчанию первая запись корпуса")
     result.add_argument("--warmup-seconds", type=positive_int, default=30)
-    result.add_argument("--phase", choices=["local", "whisper-api", "gigaam", "gigaam-prepare", "gigaam-resume", "gigaam-only", "gigaam-first-line"], default="local")
-    result.add_argument("--resume-from", type=Path, help="Папка завершённой фазы Whisper для восстановления входа без повторных запросов")
-    result.add_argument("--include-first-line", action="store_true", help="После полного GigaAM измерить VAD+ASR без голосов, эмоций и LLM (серверный стенд)")
     result.add_argument("--expected-files", type=positive_int, default=int(os.environ.get("BENCH_EXPECTED_FILES", "100")))
     result.add_argument("--api-gap", type=float, default=float(os.environ.get("BENCH_API_GAP", "5")))
     result.add_argument("--api-timeout", type=positive_int, default=int(os.environ.get("BENCH_API_TIMEOUT", "1200")))
@@ -399,183 +263,24 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-async def run_worker(request: dict) -> dict:
-    directory = Path(request["output"])
-    request_path = directory / f"{request['system']}-задание.json"
-    response_path = directory / f"{request['system']}-ответ.json"
-    process_log_path = directory / f"{request['system']}-процесс.log"
-    write_json(request_path, request)
-    worker_started = time.perf_counter()
-    process = await asyncio.create_subprocess_exec(
-        sys.executable, "-X", "faulthandler", "-m", "benchmark.worker", str(request_path),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-
-    async def capture_output():
-        with process_log_path.open("wb") as stream:
-            while chunk := await process.stdout.read(65536):
-                stream.write(chunk)
-                stream.flush()
-                sys.stdout.write(chunk.decode("utf-8", "replace"))
-                sys.stdout.flush()
-
-    output_task = asyncio.create_task(capture_output())
-    try:
-        # Три фазы: загрузка, прогрев, замер. Зависший native-код прекращаем
-        # перед запуском другой системы, чтобы измерения не пересекались.
-        await asyncio.wait_for(process.wait(), timeout=request["timeout"] * 3 + 180)
-    except (TimeoutError, asyncio.CancelledError) as exc:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
-        if isinstance(exc, asyncio.CancelledError):
-            raise
-        return {"result": {"status": "timeout", "elapsed_seconds": None, "text": "",
-                           "process_log": str(process_log_path),
-                           "error": "Превышен предел ожидания рабочего процесса; процесс остановлен"},
-                "preparation": {"system": request["system"], "included_in_measurements": False}}
-    finally:
-        await output_task
-    if process.returncode or not response_path.is_file():
-        detail = f"кодом {process.returncode}"
-        if process.returncode is not None and process.returncode < 0:
-            try:
-                detail += f" ({signal.Signals(-process.returncode).name})"
-            except ValueError:
-                pass
-        preparation_path = directory / f"{request['system']}-подготовка.json"
-        preparation = (json.loads(preparation_path.read_text(encoding="utf-8")) if preparation_path.is_file()
-                       else {"system": request["system"], "included_in_measurements": False})
-        return {"result": {"status": "error", "elapsed_seconds": None, "text": "",
-                           "process_log": str(process_log_path),
-                           "error": f"Процесс {request['system']} завершился с {detail}; стек и журнал: {process_log_path}"},
-                "preparation": preparation}
-    payload = json.loads(response_path.read_text(encoding="utf-8"))
-    payload["preparation"]["worker_wall_seconds"] = time.perf_counter() - worker_started
-    payload["preparation"]["process_exit_code"] = process.returncode
-    write_json(directory / f"{request['system']}-подготовка.json", payload["preparation"])
-    response_path.unlink(missing_ok=True)
-    return payload
-
-
-async def run(args) -> int:
-    from benchmark.llm_settings import llm_runtime
-
-    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-        os.environ[name] = str(args.threads)
-
-    files = sorted(p.resolve() for p in args.audio_dir.rglob("*") if p.is_file() and p.suffix.lower() in FORMATS)
-    if not files:
-        log.error("В папке %s нет поддерживаемых записей", args.audio_dir)
-        return 1
-    rows: list[dict] = []
-    state = "Подготовка"
-    conditions = {
-        "started_at": datetime.now().astimezone().isoformat(), "host": host_info(), "threads": args.threads,
-        "device": "cuda:0", "selected_gpu": os.environ.get("BENCH_GPU", "0"),
-        "input": "mono_16000_pcm_s16le", "concurrency": 1,
-        "order": "Чередуется: Whisper → GigaAM, затем GigaAM → Whisper",
-        "whisper": {"engine": "faster-whisper", "model": args.whisper_model, "compute_type": "float16",
-                    "beam_size": args.beam_size, "vad_filter": True, "word_timestamps": True},
-        "gigaam": {"asr_model": "v3_e2e_rnnt", "asr_backend": "официальный PyTorch CUDA",
-                   "llm_options": llm_runtime(args.threads)["options"],
-                   "llm_runtime": llm_runtime(args.threads),
-                   "ollama_flash_attention": True, "ollama_parallel": 1},
-        "isolation": "Отдельный процесс на систему и запись; другая система и её LLM выгружены",
-        "preparations": [],
-        "timers": {"clock": "perf_counter", "whisper": "Вызов распознавания и полное получение сегментов",
-                   "gigaam_total": "Подача PCM, VAD, все реплики, голоса, эмоции и завершённый ответ LLM",
-                   "gigaam_asr": "Сумма всех вызовов GigaAM-v3, включая пустые ответы",
-                   "excluded": "Общая подготовка, загрузка и прогрев моделей, запись файлов отчёта"},
-    }
-    try:
-        affinity = conditions["host"]["cpu_affinity"]
-        if affinity and len(affinity) < args.threads:
-            raise ValueError("Число потоков превышает доступные CPU; уменьшите BENCH_THREADS и CPUSET")
-        log.info("Найдено записей: %d. NVIDIA GPU, %d вспомогательных потоков CPU, один файл за раз", len(files), args.threads)
-        log.info("Общая подготовка аудио находится вне замеров систем")
-        for index, source in enumerate(files):
-            directory = f"{index + 1:04d}"
-            (args.out / directory).mkdir()
-            audio = prepare_audio(source, args.out / directory / "audio.wav")
-            row = {"audio": audio, "directory": directory, "order": system_order(index)}
-            rows.append(row)
-            log.info("Подготовлена запись %s: %.3f с, SHA256 PCM %s; подготовка %.3f с",
-                     source.name, audio.seconds, audio.sha256_pcm, audio.preparation_seconds)
-        conditions["corpus"] = [asdict(row["audio"]) for row in rows]
-        write_json(args.out / "условия.json", conditions)
-        save_reports(args.out, rows, state)
-
-        warm_source = (args.warmup_file or files[0]).resolve()
-        warm = prepare_audio(warm_source, args.out / "прогрев.wav", max_seconds=args.warmup_seconds)
-        conditions["warmup"] = {"audio": asdict(warm), "before_every_measurement": True,
-                                "included_in_measurements": False}
-        write_json(args.out / "условия.json", conditions)
-        log.info("Для каждого замера — одинаковый прогрев на %.3f с из %s, вне таблицы", warm.seconds, warm_source.name)
-
-        state = "Выполняется"
-        for index, row in enumerate(rows):
-            log.info("Запись %d/%d: %s; порядок %s", index + 1, len(rows), row["audio"].source, " → ".join(row["order"]))
-            for system in row["order"]:
-                payload = await run_worker({"system": system, "audio": asdict(row["audio"]),
-                    "warmup": asdict(warm), "output": str(args.out / row["directory"]), "log_dir": str(args.out),
-                    "threads": args.threads, "timeout": args.timeout, "whisper_model": args.whisper_model,
-                    "whisper_cache": args.whisper_cache, "beam_size": args.beam_size})
-                preparation = {"directory": row["directory"], **payload["preparation"]}
-                conditions["preparations"].append(preparation)
-                if preparation.get("gpu"):
-                    if conditions.get("gpu") and conditions["gpu"] != preparation["gpu"]:
-                        raise RuntimeError("GPU изменилась между системами; сравнение остановлено")
-                    conditions["gpu"] = preparation["gpu"]
-                write_json(args.out / "условия.json", conditions)
-                result = payload["result"]
-                row[system] = result
-                save_result(args.out, row, system, result)
-                save_reports(args.out, rows, state)
-                if result["status"] in {"error", "timeout"}:
-                    # Нативная модель может ещё работать после таймаута: другую не запускаем.
-                    state = "Остановлен из-за ошибки"
-                    log.error("Прогон остановлен; повторы и следующие системы не запускаются")
-                    return 1
-        state = "Завершён"
-        log.info("Все записи обработаны. Результаты: %s", args.out)
-        return 0
-    except asyncio.CancelledError:
-        state = "Прерван пользователем"
-        log.warning("Прогон прерван; рабочий процесс остановлен, следующие системы не запускаются")
-        raise
-    except Exception as exc:
-        state = "Остановлен из-за ошибки"
-        log.exception("Не удалось завершить прогон (%s): %s", type(exc).__name__, exc)
-        return 1
-    finally:
-        conditions["state"] = state
-        conditions["finished_at"] = datetime.now().astimezone().isoformat()
-        write_json(args.out / "условия.json", conditions)
-        save_reports(args.out, rows, state)
-
-
 def main(argv: list[str] | None = None) -> int:
+    from benchmark.server_run import whisper_phase
+
     cli = parser()
     args = cli.parse_args(argv)
     args.audio_dir, args.out = args.audio_dir.resolve(), args.out.resolve()
-    if args.phase != "local":
-        from benchmark.server_run import main as server_main
-
-        return server_main(args, cli)
-    if not args.audio_dir.is_dir():
-        cli.error("--audio-dir должен указывать на существующую папку")
-    if args.out.exists():
-        cli.error("Папка --out уже существует; выберите новую, чтобы сохранить предыдущий прогон")
-    if args.audio_dir == args.out or args.audio_dir in args.out.parents:
-        cli.error("Папка отчёта должна находиться вне папки исходных записей")
-    if args.warmup_file and not args.warmup_file.is_file():
-        cli.error("Файл --warmup-file не найден")
-    args.out.mkdir(parents=True)
+    if not args.audio_dir.is_dir() or args.audio_dir == args.out or args.audio_dir in args.out.parents:
+        cli.error("Нужна папка аудио; результаты должны находиться вне неё")
+    if args.api_gap < 5:
+        cli.error("Пауза между запросами Whisper должна быть не меньше 5 секунд")
+    if (args.out / "условия.json").exists():
+        cli.error("Прогон уже существует; выберите новую папку")
+    args.out.mkdir(parents=True, exist_ok=True)
     setup_logging(args.out)
     try:
-        return asyncio.run(run(args))
+        return asyncio.run(whisper_phase(args))
     except KeyboardInterrupt:
-        log.warning("Остановлено пользователем; сохранённые результаты находятся в %s", args.out)
+        log.warning("Прерван пользователем; запрос Whisper не повторяется, сервер может продолжать обработку")
         return 130
 
 

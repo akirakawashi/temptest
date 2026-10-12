@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import yaml
 
-from benchmark import tone_trt, tone_trt_prepare as preparation, tone_trt_run, tone_trt_worker
+from benchmark import tone_audio, tone_trt, tone_trt_prepare as preparation, tone_trt_run, tone_trt_worker
 from benchmark.compare import Audio
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,7 +93,7 @@ def test_real_official_pipeline_keeps_state_and_drains_final_phrase():
     assert result["elapsed_seconds"] == result["asr_seconds"]
     assert sum(result["timing"]["exclusive_wall_percent"].values()) == pytest.approx(100)
     assert sum(result["timing"]["exclusive_wall_seconds"].values()) == pytest.approx(result["elapsed_seconds"])
-    assert result["llm_seconds"] == 0 and result["analysis"] is None
+    assert not {"llm_seconds", "analysis"} & set(result)
     assert all(0 <= p["start"] <= p["end"] <= 1 for p in result["utterances"])
     assert client.requests[0][1]["model_version"] == "1"
     second = runner.run(np.zeros(16000, dtype=np.float32))
@@ -218,7 +218,7 @@ def args_for(tmp_path, without_kenlm=False):
             wav.writeframes(np.zeros(16000, dtype="<i2").tobytes())
     (cache / "движок.json").write_text(json.dumps({"fingerprint": {"gpu": {"uuid": "GPU-1"}}}))
     (cache / "артефакты.json").write_text("{}")
-    from benchmark.tone_run import parser
+    from benchmark.trt_common import parser
     args = parser().parse_args([str(audio), "--out", str(output), "--model-dir", str(cache),
                                "--expected-files", "2", "--gap", "0"])
     args.without_kenlm = without_kenlm
@@ -228,7 +228,7 @@ def args_for(tmp_path, without_kenlm=False):
 @pytest.mark.parametrize("without_kenlm,fail_first", [(False, False), (True, False), (False, True)])
 def test_corpus_preserves_each_variant_and_pending_files(monkeypatch, tmp_path, without_kenlm, fail_first):
     args = args_for(tmp_path, without_kenlm)
-    monkeypatch.setattr("benchmark.tone_run.prepare_audio", fake_audio)
+    monkeypatch.setattr("benchmark.trt_common.prepare_audio", fake_audio)
     monkeypatch.setattr(tone_trt_run, "gpu_snapshot", lambda: {"uuid": "GPU-1"})
     calls = []
     async def worker(request):
@@ -298,11 +298,36 @@ def test_compose_keeps_audio_off_download_and_export_and_all_ports_private():
     assert config["services"]["client"]["environment"]["NVIDIA_DRIVER_CAPABILITIES"] == "utility"
 
 
-def test_source_bundle_includes_new_image_compose_and_launcher():
+def test_source_bundle_holds_every_launcher_and_nothing_of_removed_modes():
     from benchmark.package import source_files
     names = {str(p.relative_to(ROOT)) for p in source_files()}
     assert {"Dockerfile.tone-trt-benchmark", "compose.tone-trt-benchmark.yml", "benchmark/run-tone-trt.sh",
-            "benchmark/TONE-TRT.md", "benchmark/tone_trt.py", "benchmark/tone_trt_prepare.py"} <= names
+            "benchmark/TONE-TRT.md", "benchmark/tone_trt.py", "benchmark/tone_trt_prepare.py",
+            "compose.gigaam-trt-benchmark.yml", "benchmark/run-gigaam-trt.sh", "benchmark/GIGAAM-TRT.md",
+            "benchmark/gigaam_trt.py", "benchmark/trt_common.py", "benchmark/pipeline.py",
+            "Dockerfile.benchmark", "compose.trt-base.yml", "requirements.txt", "scripts/download_models.sh",
+            "Dockerfile.whisper-client", "compose.benchmark.yml", "benchmark/run.sh", "app/session.py"} <= names
+    removed = {"benchmark/run-tone.sh", "benchmark/tone.py", "benchmark/tone_run.py", "benchmark/tone_worker.py",
+               "benchmark/TONE.md", "Dockerfile.tone-benchmark", "compose.tone-benchmark.yml",
+               "benchmark/worker.py", "benchmark/gpu.py", "benchmark/llm_settings.py", "benchmark/prefetch.py"}
+    assert not removed & names and not any((ROOT / name).exists() for name in removed)
+
+
+@pytest.mark.parametrize("length", [0, 1, 16, 127, 16000])
+def test_resampling_preserves_correct_duration_even_for_short_input(length):
+    result = tone_audio.to_8k(np.zeros(length, dtype=np.float32))
+    assert len(result) == (length + 1) // 2
+    assert result.dtype == np.float32 and result.flags.c_contiguous
+
+
+def test_resampling_matches_source_filter_and_suppresses_aliasing():
+    times = np.arange(16000) / 16000
+    low = np.sin(2 * np.pi * 1000 * times).astype(np.float32)
+    high = np.sin(2 * np.pi * 6000 * times).astype(np.float32)
+    assert np.max(np.abs(tone_audio.to_8k(high)[100:-100])) < .001
+    assert np.max(np.abs(tone_audio.to_8k(low)[100:-100])) > .99
+    expected = np.convolve(low, tone_audio.LOWPASS_8K, mode="same")[::2]
+    np.testing.assert_array_equal(tone_audio.to_8k(low), expected)
 
 
 def test_finalize_works_without_dependencies_or_models(tmp_path):

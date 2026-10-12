@@ -18,7 +18,7 @@ import time
 from benchmark.audio_check import decoder_info
 from benchmark.compare import Audio, host_info, setup_logging
 from benchmark.summary import write_summary
-from benchmark.tone_run import prepare, run_worker, save_json, VAD_SETTINGS
+from benchmark.trt_common import VAD_SETTINGS, parser, prepare, run_worker, save_json
 from benchmark.tone_trt_prepare import TONE_REF, HF_REF, gpu_snapshot
 
 log = logging.getLogger("прогон-t-one-trt")
@@ -172,11 +172,8 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--finalize":
         finalize(Path(sys.argv[2]), int(sys.argv[3]))
         return 0
-    from benchmark.tone_run import parser
-
     cli = parser()
     cli.description = __doc__
-    cli.set_defaults(model_dir=Path("/cache"))
     cli.add_argument("--without-kenlm", action="store_true", help="Только TensorRT greedy, без второго прогона")
     args = cli.parse_args()
     if (min(args.expected_files, args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0

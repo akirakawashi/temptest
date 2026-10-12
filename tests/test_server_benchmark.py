@@ -9,20 +9,18 @@ import signal
 import subprocess
 import sys
 import tarfile
+import time
 
 import httpx
 import pytest
 
-from benchmark import artifacts, compare, server_run
+from benchmark import artifacts, compare, server_run, summary
 from benchmark.whisper_api import TEST_URL, WhisperAPI, speech_seconds, validate_url
-from test_benchmark import install_fake_runners, write_wav
+from test_benchmark import write_wav
 
 
-@pytest.mark.parametrize("phase,count,expected_code", [
-    ("gigaam-prepare", "2", 0), ("gigaam-prepare", "3", 1), ("whisper-api", "3", 1),
-])
-def test_cpu_preparation_and_artifacts_work_with_only_benchmark_package(tmp_path, phase, count, expected_code):
-    """Как COPY benchmark в CPU-образе: app отсутствует, моделей и API нет."""
+def test_client_and_artifacts_work_with_only_benchmark_package(tmp_path):
+    """Как COPY benchmark в образе клиента Whisper: app отсутствует, моделей и API нет."""
     project = Path(__file__).resolve().parents[1]
     image = tmp_path / "cpu-image"
     shutil.copytree(project / "benchmark", image / "benchmark", ignore=shutil.ignore_patterns("__pycache__"))
@@ -53,40 +51,24 @@ if module == "benchmark.compare":
     sys.modules["faster_whisper.audio"] = decoder
 runpy.run_module(module, run_name="__main__")
 '''
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "LLM_NUM_CTX": "8192",
-           "CPU_TEST_NUMPY_PATH": str(Path(sys.modules["numpy"].__file__).resolve().parents[1]),
-           "BENCH_LLM_NUM_BATCH": "64", "BENCH_LLM_KV_CACHE_TYPE": "q8_0"}
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+           "CPU_TEST_NUMPY_PATH": str(Path(sys.modules["numpy"].__file__).resolve().parents[1])}
+    # Число записей не совпадает с ожидаемым: клиент останавливается до первого запроса к серверу.
     command = [sys.executable, "-I", "-c", bootstrap, str(image), "benchmark.compare",
-               "--phase", phase, "--audio-dir", str(source), "--out", str(output),
-               "--expected-files", count, "--threads", "1"]
+               "--audio-dir", str(source), "--out", str(output), "--expected-files", "3"]
     prepared = subprocess.run(command, cwd=image, env=env, capture_output=True, text=True, timeout=15)
-    assert prepared.returncode == expected_code, prepared.stdout + prepared.stderr
+    assert prepared.returncode == 1, prepared.stdout + prepared.stderr
     conditions = json.loads((output / "условия.json").read_text())
-    assert conditions["gigaam"]["llm_runtime"]["options"]["num_ctx"] == 8192
-    if expected_code == 0:
-        assert conditions["state"] == "GigaAM подготовлен" and len(conditions["records"]) == 2
-        assert len(list((output / "временные").glob("*.wav"))) == 3
-    assert not list(output.rglob("gigaam.json")) and not list(output.rglob("whisper.json"))
+    assert conditions["mode"] == "whisper_only" and conditions["planned_systems"] == ["whisper"]
+    assert conditions["state"].startswith("Остановлен") and not list(output.rglob("whisper.json"))
     finalized = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(image), "benchmark.artifacts",
-                                str(output), "--exit-code", str(expected_code)], cwd=image, env=env,
+                                str(output), "--exit-code", "1"], cwd=image, env=env,
                                capture_output=True, text=True, timeout=15)
     assert finalized.returncode == 0, finalized.stdout + finalized.stderr
     assert not (output / "временные").exists()
     with tarfile.open(output / "диагностика.tar.gz") as archive:
         assert "отчёт.html" in archive.getnames()
         assert all(not name.endswith(".wav") for name in archive.getnames())
-
-
-def test_gpu_reserve_stops_only_benchmark_model_loading(monkeypatch):
-    from types import SimpleNamespace
-    from benchmark.gpu import log_gpu_memory
-
-    monkeypatch.setenv("BENCH_GPU_RESERVE_MIB", "4096")
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(
-        mem_get_info=lambda _: (3000 * 1024 ** 2, 95830 * 1024 ** 2),
-        memory_allocated=lambda _: 1, memory_reserved=lambda _: 1)))
-    with pytest.raises(RuntimeError, match="Останавливаем только стенд"):
-        log_gpu_memory("загрузки ASR")
 
 
 @pytest.mark.parametrize("url", ["https://api.openai.com/v1", "http://1.1.1.1/v1", "http://user:password@10.0.0.1/v1", "http://10.0.0.1/v1?token=abc"])
@@ -174,14 +156,13 @@ def test_wrong_model_is_rejected_before_transcription():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure", [False, True])
-def test_all_whisper_requests_precede_gigaam_and_error_blocks_phase(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "warmup", "record"])
+def test_whisper_corpus_is_warmed_up_measured_and_stops_on_first_error(tmp_path, monkeypatch, failure):
     source, output = tmp_path / "input", tmp_path / "output"
     source.mkdir()
     output.mkdir()
     write_wav(source / "1.wav", 100)
     write_wav(source / "2.wav", 200)
-    calls = install_fake_runners(monkeypatch)
     api_calls = []
 
     class API:
@@ -196,38 +177,74 @@ def test_all_whisper_requests_precede_gigaam_and_error_blocks_phase(tmp_path, mo
             pass
         async def run(self, path, duration):
             api_calls.append(path.name)
-            return {"status": "error" if failure else "ok", "mode": "test_server_api", "elapsed_seconds": 1,
-                    "segments": [], "text": "Тест", "speech_seconds": 0, "error": "Ошибка" if failure else None}
+            failed = failure == "warmup" or (failure == "record" and len(api_calls) == 2)
+            return {"status": "error" if failed else "ok", "mode": "test_server_api", "elapsed_seconds": 1,
+                    "segments": [], "text": "Тест", "speech_seconds": 0, "error": "Ошибка" if failed else None}
 
     async def no_sleep(*args):
         pass
     monkeypatch.setattr(server_run, "WhisperAPI", API)
     monkeypatch.setattr(server_run.asyncio, "sleep", no_sleep)
-    args = compare.parser().parse_args(["--audio-dir", str(source), "--out", str(output), "--expected-files", "2", "--threads", "1"])
-    assert asyncio.run(server_run.whisper_phase(args)) == int(failure)
-    assert not calls  # GigaAM не загрузилась во время фазы Whisper.
-    if failure:
-        assert len(api_calls) == 1
-        with pytest.raises(ValueError):
-            asyncio.run(server_run.gigaam_phase(args))
+    args = compare.parser().parse_args(["--audio-dir", str(source), "--out", str(output), "--expected-files", "2"])
+    assert asyncio.run(server_run.whisper_phase(args)) == int(failure is not None)
+    conditions = json.loads((output / "условия.json").read_text())
+    result = json.loads((output / "итоги.json").read_text())
+    assert conditions["mode"] == "whisper_only" and list(result["systems"]) == ["whisper"]
+    assert conditions["phases"]["whisper"]["state"] == conditions["state"]
+    statuses = result["systems"]["whisper"]["statuses"]
+    if failure == "warmup":
+        assert len(api_calls) == 1 and not list(output.glob("записи/*/whisper.json"))
+        assert conditions["state"].startswith("Остановлен") and statuses["pending"] == 2
+    elif failure == "record":
+        # Прогрев и первая запись; вторая запись не отправляется.
+        assert len(api_calls) == 2 and len(list(output.glob("записи/*/whisper.json"))) == 1
+        assert conditions["state"].startswith("Остановлен") and statuses["error"] == statuses["pending"] == 1
     else:
         assert len(api_calls) == 3  # Отдельный прогрев, затем две измеряемые записи.
         assert len(list(output.glob("записи/*/whisper.json"))) == 2
-        conditions = json.loads((output / "условия.json").read_text())
+        assert conditions["state"] == "Завершён" and statuses["ok"] == 2
         assert conditions["whisper"]["warmup"]["included_in_measurements"] is False
-        with pytest.raises(ValueError, match="остановить тестовый Whisper"):
-            asyncio.run(server_run.gigaam_phase(args))
-        assert not calls
-        (output / "логи").mkdir()
-        (output / "логи" / "тестовый-whisper-остановлен.txt").write_text("Остановлен")
-        assert asyncio.run(server_run.gigaam_phase(args)) == 0
-        assert [name for name, _ in calls] == ["gigaam", "gigaam"]
-        assert (output / "отчёт.html").is_file()
-        artifacts.finalize(output, 0)
-        assert not (output / "временные").exists()
-        with tarfile.open(output / "диагностика.tar.gz") as archive:
-            assert "отчёт.html" in archive.getnames()
-            assert all(not name.endswith(".wav") for name in archive.getnames())
+        assert result["systems"]["whisper"]["records_per_15_minutes"] == 900
+        markdown, page = (output / "отчёт.md").read_text(), (output / "отчёт.html").read_text()
+        assert "Успешных: 2." in markdown and "Whisper: 2.000 с; среднее 1.000 с" in markdown
+        assert "Успешно: <b>2 из 2</b>" in page and "GigaAM" not in page + markdown
+        header = (output / "сводка.csv").read_text(encoding="utf-8-sig").splitlines()[0]
+        assert "Whisper, с" in header and "GigaAM" not in header and "Первая линия" not in header
+    artifacts.finalize(output, int(failure is not None))
+    assert not (output / "временные").exists()
+    assert json.loads((output / "условия.json").read_text())["launcher_exit_code"] == int(failure is not None)
+    with tarfile.open(output / "диагностика.tar.gz") as archive:
+        assert "отчёт.html" in archive.getnames()
+        assert all(not name.endswith(".wav") for name in archive.getnames())
+
+
+def test_summary_marks_whisper_stages_as_unmeasured(tmp_path):
+    row = {"directory": "записи/0001", "audio": compare.Audio("test.wav", "prepared.wav", 10, 160000, "test", .1),
+           "whisper": {"status": "ok", "elapsed_seconds": 1}}
+    result = summary.write_summary(tmp_path, [row], {"state": "Завершён", "mode": "whisper_only", "planned_systems": ["whisper"]})
+    stages = result["systems"]["whisper"]["stages"]
+    assert set(stages) == {"vad", "asr"}
+    for stage in stages.values():
+        assert stage["enabled"] is True and stage["measured"] is False
+        assert stage["seconds"] == {"count": 0}
+        assert stage["calls"] is None and stage["operation_time_vs_total_percent"] is None
+    assert result["matched_comparison"] == {"records": 1, "processing_seconds": {"whisper": 1}}
+    header = (tmp_path / "замеры.csv").read_text(encoding="utf-8-sig").splitlines()[0]
+    assert "LLM" not in header and "Голоса" not in header and "Эмоции" not in header
+
+
+def test_existing_run_is_rejected_before_any_request(tmp_path, monkeypatch):
+    source, output = tmp_path / "input", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    (output / "условия.json").write_text("{}")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Клиент не должен создаваться")
+    monkeypatch.setattr(server_run, "WhisperAPI", forbidden)
+    with pytest.raises(SystemExit) as error:
+        compare.main(["--audio-dir", str(source), "--out", str(output)])
+    assert error.value.code == 2
+    assert (output / "условия.json").read_text() == "{}"
 
 
 def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
@@ -242,192 +259,8 @@ def test_incorrect_corpus_size_sends_no_requests(tmp_path, monkeypatch):
     assert asyncio.run(server_run.whisper_phase(args)) == 1
 
 
-@pytest.mark.parametrize("failure", [None, "count", "duration", "warmup"])
-def test_gigaam_only_prepares_new_corpus_without_whisper_and_preserves_previous_results(tmp_path, monkeypatch, failure):
-    import wave
-    from benchmark import pipeline
-
-    monkeypatch.setenv("BENCH_LLM_NUM_BATCH", "64")
-    monkeypatch.setenv("BENCH_LLM_KV_CACHE_TYPE", "q8_0")
-    source, output = tmp_path / "input", tmp_path / "new-results"
-    source.mkdir()
-    write_wav(source / "1.wav", 100)
-    write_wav(source / "2.wav", 200)
-    if failure == "duration":
-        with wave.open(str(source / "1.wav"), "wb") as wav:
-            wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
-            wav.writeframes(b'\0\0' * 32000)
-    previous = tmp_path / "old-results" / "записи" / "0001" / "whisper.json"
-    previous.parent.mkdir(parents=True)
-    previous.write_text('{"text":"Сохранённый результат Whisper"}\n')
-    original = previous.read_bytes()
-    calls = install_fake_runners(monkeypatch, warm_giga_status="error" if failure == "warmup" else "ok")
-    forbidden_calls = []
-
-    def forbidden(*args, **kwargs):
-        forbidden_calls.append(args)
-        raise AssertionError("Whisper и его API не должны использоваться")
-
-    monkeypatch.setattr(server_run, "WhisperAPI", forbidden)
-    monkeypatch.setattr(pipeline, "WhisperPipeline", forbidden)
-    args = ["--phase", "gigaam-prepare", "--audio-dir", str(source), "--out", str(output),
-            "--expected-files", "3" if failure == "count" else "2", "--threads", "1", "--api-gap", "0"]
-    if failure == "duration":
-        args.extend(["--max-audio-seconds", "1"])
-    code = compare.main(args)
-    assert code == int(failure in {"count", "duration"})
-    assert not calls
-    if code == 0:
-        args[1] = "gigaam-only"
-        code = compare.main(args)
-    assert code == int(failure is not None)
-    assert not forbidden_calls
-    assert previous.read_bytes() == original
-    assert not list(output.rglob("whisper.json"))
-    conditions = json.loads((output / "условия.json").read_text())
-    assert conditions["mode"] == "gigaam_only" and conditions["whisper"]["enabled"] is False
-    runtime = conditions["gigaam"]["llm_runtime"]
-    assert runtime["options"]["num_ctx"] == 8192 and runtime["options"]["num_batch"] == 64
-    assert runtime["options"]["num_gpu"] == 999 and runtime["kv_cache_type_requested"] == "q8_0"
-    if failure:
-        assert not calls
-        assert conditions["state"].startswith("Остановлен")
-    else:
-        assert [name for name, _ in calls] == ["gigaam", "gigaam"]
-        assert len(list(output.glob("записи/*/gigaam.json"))) == 2
-        assert conditions["state"] == "Завершён"
-        assert all(record["order"] == ["gigaam"] for record in conditions["records"])
-        assert conditions["warmup"]["included_in_measurements"] is False
-        assert "GigaAM — полный цикл: 6.000 с" in (output / "отчёт.md").read_text()
-        assert "1.400 с" in (output / "графики" / "итоги.svg").read_text()
-        assert "3.000 с" in (output / "графики" / "этапы-gigaam.svg").read_text()
-        assert "успешных результатов GigaAM: 2" in (output / "отчёт.html").read_text()
-        assert "Контекст LLM: 8192; батч: 64; KV-кеш (задано): q8_0" in (output / "отчёт.html").read_text()
-        assert all(item["llm_runtime"] == runtime for item in conditions["preparations"])
-        with pytest.raises(ValueError, match="повторного запуска"):
-            compare.main(args)
-        args[1] = "gigaam-prepare"
-        with pytest.raises(SystemExit) as error:
-            compare.main(args)
-        assert error.value.code == 2
-    artifacts.finalize(output, code)
-    assert not (output / "временные").exists()
-    with tarfile.open(output / "диагностика.tar.gz") as archive:
-        assert "отчёт.html" in archive.getnames()
-        assert not any(name.endswith(("whisper.json", ".wav")) for name in archive.getnames())
-    if not failure:
-        assert "GigaAM — полный цикл: 6.000 с" in (output / "отчёт.md").read_text()
-
-
-@pytest.mark.parametrize("resume", [False, True])
-@pytest.mark.parametrize("failure", [None, "build", "prefetch", "gigaam", "whisper-running", "hup", "prepare"])
-def test_gigaam_only_launcher_starts_no_whisper_and_preserves_old_results(tmp_path, failure, resume):
-    folder = tmp_path / "stand"
-    (folder / "benchmark").mkdir(parents=True)
-    (folder / "audio").mkdir()
-    script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
-    (folder / "benchmark" / "run.sh").write_bytes(script.read_bytes())
-    previous = folder / "benchmark-results" / "previous" / "whisper.json"
-    previous.parent.mkdir(parents=True)
-    previous.write_text("Сохранённый Whisper")
-    (previous.parent / "условия.json").write_text('{}')
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    command_log = tmp_path / "commands.log"
-    ready = tmp_path / "gigaam-ready"
-    docker = bin_dir / "docker"
-    docker.write_text('#!/usr/bin/env python3\nimport os,sys,time\nfrom pathlib import Path\na=sys.argv[1:]; failure=os.environ["FAILURE"]\n'
-                      'with open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
-                      'if a[0]=="compose" and "ps" in a and failure=="whisper-running": print("own-whisper-id")\n'
-                      'if a[0]=="compose" and "build" in a and failure=="build": sys.exit(23)\n'
-                      'if a[0]=="info": print("/tmp")\n'
-                      'if a[0]=="wait":\n'
-                      ' if "-gigaam-" in a[-1] and failure=="hup":\n'
-                      '  Path(os.environ["READY"]).touch()\n'
-                      '  while True: time.sleep(60)\n'
-                      ' print(51 if "-prefetch-" in a[-1] and failure=="prefetch" else 47 if "-gigaam-" in a[-1] and failure=="gigaam" else 53 if "-audio-prepare-" in a[-1] and failure=="prepare" else 0)\n'
-                      'if a[0]=="logs" and "--follow" in a:\n'
-                      ' print("Тест: журнал GigaAM",flush=True)\n'
-                      ' while True: time.sleep(60)\n'
-                      'sys.exit(0)\n')
-    nvidia = bin_dir / "nvidia-smi"
-    nvidia.write_text('#!/usr/bin/env python3\nimport sys\na=" ".join(sys.argv)\n'
-                      'print("14600" if "--query-gpu=memory.free" in a else "100" if "--query-gpu=utilization.gpu" in a else "2026/10/08, uuid, 100, 1000, 14600, 95830, 80, 32")\n')
-    docker.chmod(0o755)
-    nvidia.chmod(0o755)
-    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
-           "FAILURE": failure or "", "READY": str(ready), "BENCH_GPU_MIN_FREE_MIB": "12288",
-           "BENCH_GPU_MAX_UTIL": "100", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
-    with (tmp_path / "terminal.log").open("w") as terminal:
-        mode = ["--resume-gigaam", str(previous.parent)] if resume else ["--gigaam-only"]
-        process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio"),
-                                    *mode, "--expected-files", "2"], env=env, stdin=subprocess.DEVNULL,
-                                   stdout=terminal, stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            if failure == "hup":
-                import time
-                deadline = time.monotonic() + 10
-                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                assert ready.exists()
-                os.killpg(process.pid, signal.SIGHUP)
-            code = process.wait(timeout=15)
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-    assert code == {None: 0, "build": 23, "prefetch": 51, "gigaam": 47, "whisper-running": 42, "hup": 129, "prepare": 53}[failure]
-    assert previous.read_text() == "Сохранённый Whisper"
-    commands = [ast.literal_eval(line) for line in command_log.read_text().splitlines()]
-    for command in commands:
-        assert not any(name in str(command) for name in ("whisper-asr", "model-proxy", "vllm", "10.220.21.2"))
-        assert not {"--rm", "--remove-orphans", "rm", "down"} & set(command)
-        assert not any(name in str(command) for name in ("whisper-download", "whisper-api"))
-        if "whisper-client" in command:
-            assert command[0] == "compose" and "build" in command
-        if "whisper-bench" in command:
-            assert command[0] == "compose" and "ps" in command
-        if command[0] == "compose" and command[1:] != ["version"]:
-            assert command[command.index("--project-name") + 1] == "speech-comparison"
-    gigaam_runs = [c for c in commands if c[0] == "compose" and "run" in c and "compare" in c]
-    assert bool(gigaam_runs) is (failure not in {"build", "prefetch", "whisper-running", "prepare"})
-    if gigaam_runs:
-        assert "--expected-files" in gigaam_runs[0] and "2" in gigaam_runs[0]
-        assert "compare" in gigaam_runs[0] and "--detach" in gigaam_runs[0]
-        preparation = next(c for c in commands if "audio-prepare" in c and "run" in c)
-        assert ("gigaam-resume" if resume else "gigaam-prepare") in preparation
-        assert commands.index(preparation) < commands.index(gigaam_runs[0])
-        assert ("gigaam" if resume else "gigaam-only") in gigaam_runs[0]
-        first_runs = [c for c in commands if "gigaam-first-line" in c]
-        assert bool(first_runs) is (resume and failure is None)
-        if first_runs:
-            stop_ollama = next(c for c in commands if "stop" in c and "ollama" in c)
-            assert commands.index(gigaam_runs[0]) < commands.index(stop_ollama) < commands.index(first_runs[0])
-    if failure == "prepare":
-        assert not any("compare" in c and "build" in c or "ollama" in c and "up" in c for c in commands)
-    logs = list((folder / "benchmark-results").glob("*/логи/запуск.log"))
-    assert len(logs) == 1
-    if failure == "hup":
-        assert "Получен SIGHUP" in logs[0].read_text()
-        assert "Завершение: код 129" in logs[0].read_text()
-
-
-@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console, gigaam_exit, first_line_exit", [
-    (*case, False, False, 0, 0) for case in [
-    (14600, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0, 0, 0),
-    (90000, 0, 16384, 10, 0, 0, 0, 0, 0, 0), (14600, 100, 12288, 10, 0, 0, 0, 0, 0, 0),
-    (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0), (3000, 100, 12288, 100, 0, 0, 0, 0, 0, 0),
-    (14600, 100, 12288, 100, 0, 23, 0, 0, 0, 0), (14600, 100, 12288, 100, 0, 0, 31, 0, 0, 0),
-    (14600, 100, 12288, 100, 0, 0, 0, 32, 0, 0), (14600, 100, 12288, 100, 0, 0, 0, 0, 51, 0),
-    (14600, 100, 12288, 100, 0, 0, 0, 0, 0, 52),
-    ]
-] + [
-    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, True, False, 0, 0, id="completed-whisper-log-reader-ignores-sigterm"),
-    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, True, 0, 0, id="blocked-console-does-not-stop-gigaam"),
-    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, False, 47, 0, id="full-gigaam-error-blocks-first-line"),
-    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, 0, False, False, 0, 48, id="first-line-error-is-failed-launch"),
-])
-def test_launcher_never_controls_production_and_does_not_start_gigaam_after_failure(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ollama_download_start_exit, ignore_log_term, blocked_console, gigaam_exit, first_line_exit):
+def fake_stand(tmp_path):
+    """Копия run.sh в пустой папке и подменные docker/nvidia-smi, которые только записывают команды."""
     folder = tmp_path / "stand"
     (folder / "benchmark").mkdir(parents=True)
     script = Path(__file__).resolve().parents[1] / "benchmark" / "run.sh"
@@ -435,18 +268,16 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
     (folder / "audio").mkdir()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    command_log = tmp_path / "commands.log"
-    log_reader_ready = tmp_path / "log-reader.ready"
     docker = bin_dir / "docker"
     docker.write_text('#!/usr/bin/env python3\nimport os,sys,time,signal\nfrom pathlib import Path\na=sys.argv[1:]\nwith open(os.environ["COMMAND_LOG"],"a") as f: f.write(repr(a)+"\\n")\n'
                       'if a[0] == "compose" and "build" in a and a[-1] == "whisper-client": sys.exit(int(os.environ["CLIENT_BUILD_EXIT"]))\n'
                       'if a[0] == "compose" and "up" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_START_EXIT"]))\n'
                       'if a[0] == "compose" and "stop" in a and a[-1] == "whisper-bench": sys.exit(int(os.environ["WHISPER_STOP_EXIT"]))\n'
-                      'if a[0] == "compose" and "up" in a and a[-1] == "ollama-download": sys.exit(int(os.environ["OLLAMA_DOWNLOAD_START_EXIT"]))\n'
                       'if a[0] == "compose" and "run" in a: assert sys.stdin.buffer.read(1) == b""\n'
                       'if a[0] == "wait":\n'
-                      ' if "-gigaam-" in a[-1]: print(os.environ["GIGAAM_EXIT"]); sys.exit(0)\n'
-                      ' if "-first-line-" in a[-1]: print(os.environ["FIRST_LINE_EXIT"]); sys.exit(0)\n'
+                      ' if "-client-" in a[-1] and os.environ["HANG_CLIENT"] == "1":\n'
+                      '  Path(os.environ["CLIENT_WAITING"]).touch()\n'
+                      '  while True: time.sleep(60)\n'
                       ' if "-client-" in a[-1] and (os.environ["IGNORE_LOG_TERM"] == "1" or os.environ["BLOCKED_CONSOLE"] == "1"):\n'
                       '  while not Path(os.environ["LOG_READER_READY"]).exists(): time.sleep(0.01)\n'
                       ' print(os.environ["WHISPER_DOWNLOAD_EXIT"] if "-whisper-download-" in a[-1] else os.environ["API_EXIT"] if "-client-" in a[-1] else "0"); sys.exit(0)\n'
@@ -466,24 +297,42 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
                       'print(os.environ["FREE_GPU"] if "--query-gpu=memory.free" in a else os.environ["GPU_UTIL"] if "--query-gpu=utilization.gpu" in a else "2026/10/07, uuid, 0, 1000, 90000, 95830, 80, 32")\n')
     docker.chmod(0o755)
     nvidia.chmod(0o755)
-    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(command_log),
-           "IGNORE_LOG_TERM": "1" if ignore_log_term else "0", "LOG_READER_READY": str(log_reader_ready),
-           "BLOCKED_CONSOLE": "1" if blocked_console else "0",
-           "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
-           "BENCH_GPU_MAX_UTIL": str(max_util),
-           "BENCH_BUILD_NETWORK": "default",
-           "BENCH_DOWNLOAD_NETWORK": "host", "BENCH_OLLAMA_DOWNLOAD_PORT": "11435",
-           "API_EXIT": str(api_exit), "CLIENT_BUILD_EXIT": str(client_build_exit),
-           "GIGAAM_EXIT": str(gigaam_exit), "FIRST_LINE_EXIT": str(first_line_exit),
-           "WHISPER_START_EXIT": str(whisper_start_exit), "WHISPER_STOP_EXIT": str(whisper_stop_exit),
-           "WHISPER_DOWNLOAD_EXIT": str(whisper_download_exit), "OLLAMA_DOWNLOAD_START_EXIT": str(ollama_download_start_exit),
-           "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
+    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "COMMAND_LOG": str(tmp_path / "commands.log"),
+           "IGNORE_LOG_TERM": "0", "BLOCKED_CONSOLE": "0", "LOG_READER_READY": str(tmp_path / "log-reader.ready"),
+           "HANG_CLIENT": "0", "CLIENT_WAITING": str(tmp_path / "client.waiting"),
+           "FREE_GPU": "14600", "GPU_UTIL": "100", "BENCH_GPU_MIN_FREE_MIB": "12288", "BENCH_GPU_MAX_UTIL": "100",
+           "BENCH_BUILD_NETWORK": "default", "BENCH_DOWNLOAD_NETWORK": "host",
+           "API_EXIT": "0", "CLIENT_BUILD_EXIT": "0", "WHISPER_START_EXIT": "0", "WHISPER_STOP_EXIT": "0",
+           "WHISPER_DOWNLOAD_EXIT": "0", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0"}
+    return folder, env
+
+
+@pytest.mark.parametrize("free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ignore_log_term, blocked_console", [
+    (*case, False, False) for case in [
+    (14600, 0, 16384, 10, 0, 0, 0, 0, 0), (90000, 0, 16384, 10, 47, 0, 0, 0, 0),
+    (90000, 0, 16384, 10, 0, 0, 0, 0, 0), (14600, 100, 12288, 10, 0, 0, 0, 0, 0),
+    (14600, 100, 12288, 100, 0, 0, 0, 0, 0), (3000, 100, 12288, 100, 0, 0, 0, 0, 0),
+    (14600, 100, 12288, 100, 0, 23, 0, 0, 0), (14600, 100, 12288, 100, 0, 0, 31, 0, 0),
+    (14600, 100, 12288, 100, 0, 0, 0, 32, 0), (14600, 100, 12288, 100, 0, 0, 0, 0, 51),
+    ]
+] + [
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, True, False, id="completed-whisper-log-reader-ignores-sigterm"),
+    pytest.param(14600, 100, 12288, 100, 0, 0, 0, 0, 0, False, True, id="blocked-console-does-not-stop-the-run"),
+])
+def test_launcher_runs_only_own_whisper_and_never_controls_production(tmp_path, free, util, min_free, max_util, api_exit, client_build_exit, whisper_start_exit, whisper_stop_exit, whisper_download_exit, ignore_log_term, blocked_console):
+    folder, env = fake_stand(tmp_path)
+    command_log, log_reader_ready = tmp_path / "commands.log", tmp_path / "log-reader.ready"
+    env.update({"IGNORE_LOG_TERM": "1" if ignore_log_term else "0", "BLOCKED_CONSOLE": "1" if blocked_console else "0",
+                "FREE_GPU": str(free), "GPU_UTIL": str(util), "BENCH_GPU_MIN_FREE_MIB": str(min_free),
+                "BENCH_GPU_MAX_UTIL": str(max_util), "API_EXIT": str(api_exit), "CLIENT_BUILD_EXIT": str(client_build_exit),
+                "WHISPER_START_EXIT": str(whisper_start_exit), "WHISPER_STOP_EXIT": str(whisper_stop_exit),
+                "WHISPER_DOWNLOAD_EXIT": str(whisper_download_exit)})
     # Вход родительского терминала остаётся открытым; поток Docker logs не даёт EOF.
     # Для blocked_console stdout — заполненная труба, которую до выхода никто не читает.
     # Завершение контейнера должно перевести прогон дальше независимо от вывода.
     with (tmp_path / "terminal.log").open("w+") as terminal:
-        process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE if blocked_console else terminal,
+        process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio"), "--expected-files", "2"],
+                                   env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE if blocked_console else terminal,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         try:
             returncode = process.wait(timeout=15)
@@ -498,56 +347,53 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
             process.stdout.close()
         else:
             console = terminal.read()
-        launch_log = next((folder / "benchmark-results").glob("*/логи/запуск.log"))
-        result = subprocess.CompletedProcess(process.args, returncode, stdout=launch_log.read_text(), stderr="")
+        launch_log = next((folder / "benchmark-results").glob("*/логи/запуск.log")).read_text()
     precheck_failed = free < min_free or util > max_util
-    assert result.returncode == (42 if precheck_failed else client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)) or ollama_download_start_exit or gigaam_exit or first_line_exit)
-    commands = command_log.read_text()
-    builds = [command for line in commands.splitlines()
-              if (command := ast.literal_eval(line))[0] == "compose" and "build" in command]
+    assert returncode == (42 if precheck_failed else client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or int(bool(whisper_stop_exit)))
+    text = command_log.read_text()
+    commands = [ast.literal_eval(line) for line in text.splitlines()]
+    builds = [command for command in commands if command[0] == "compose" and "build" in command]
     for build in builds:
         assert build[build.index("--project-name") + 1] == "speech-comparison"
         assert build[build.index("--project-directory") + 1] == str(folder)
         assert build[build.index("-f") + 1] == str(folder / "compose.benchmark.yml")
         assert build[build.index("--progress") + 1] == "plain"
-        assert build[-1] in {"whisper-client", "compare"}
-    assert "'buildx', 'build'" not in commands
-    assert "whisper-asr" not in commands and "model-proxy" not in commands and "vllm" not in commands
-    if precheck_failed or client_build_exit or whisper_download_exit or whisper_start_exit or api_exit or whisper_stop_exit:
-        assert "'build', 'compare'" not in commands and "'up', '-d', 'ollama'" not in commands
-        assert len(builds) == (0 if precheck_failed else 1)
-    else:
-        assert len(builds) == 2
-        assert commands.index("whisper-api") < commands.index("'stop', 'whisper-bench'") < commands.index("'build', 'compare'")
-        download_up = next(ast.literal_eval(line) for line in commands.splitlines()
-                           if "'up'" in line and "'ollama-download'" in line)
-        assert "--wait" in download_up and "--wait-timeout" in download_up
-        assert "'stop', 'ollama-download'" in commands
-        if ollama_download_start_exit:
-            assert "'exec', '--interactive=false', '-T', 'ollama-download'" not in commands
-            assert "'up', '-d', 'ollama'" not in commands
-        else:
-            assert commands.index("'build', 'compare'") < commands.index("'up', '-d', 'ollama'")
-            assert "'stop', 'ollama'" in commands
-            waits = [ast.literal_eval(line) for line in commands.splitlines()
-                     if ast.literal_eval(line)[0] == "wait"]
-            assert len(waits) == (4 if gigaam_exit else 5)
-            prefixes = ("speech-comparison-whisper-download-", "speech-comparison-client-",
-                        "speech-comparison-prefetch-", "speech-comparison-gigaam-", "speech-comparison-first-line-")
-            assert all(task[1].startswith(prefix) for task, prefix in zip(waits, (
-                prefixes[:len(waits)]), strict=True))
-            if gigaam_exit:
-                assert "gigaam-first-line" not in commands
-            else:
-                assert commands.index("'stop', 'ollama'") < commands.index("gigaam-first-line")
+        assert build[-1] == "whisper-client"
+    assert len(builds) == (0 if precheck_failed else 1)
+    assert "'buildx', 'build'" not in text
+    for word in ("whisper-asr", "model-proxy", "vllm", "10.220.21.2", "WHISPER_API_KEY", "ollama", "gigaam", "first-line", "prefetch"):
+        assert word not in text
+    for command in commands:
+        assert not {"--rm", "--remove-orphans", "rm", "down"} & set(command)
+        if command[0] == "compose" and command[1:] != ["version"]:
+            assert command[command.index("--project-name") + 1] == "speech-comparison"
+        if command[0] == "compose" and "run" in command:
+            assert "--detach" in command and "--interactive=false" in command and "-T" in command
+    waits = [command[1] for command in commands if command[0] == "wait"]
+    client_runs = [command for command in commands if command[0] == "compose" and "run" in command and "whisper-client" in command]
+    reached_download = not (precheck_failed or client_build_exit)
+    reached_client = reached_download and not (whisper_download_exit or whisper_start_exit)
+    assert [name.rsplit("-", 3)[0] for name in waits] == (["speech-comparison-whisper-download"] if reached_download else []) + (["speech-comparison-client"] if reached_client else [])
+    assert len(client_runs) == int(reached_client)
+    if reached_client:
+        client = client_runs[0]
+        assert client[-6:] == ["--expected-files", "2", "--audio-dir", "/recordings", "--out", "/results/" + waits[1].split("-client-")[1]]
+        assert "--phase" not in client
+        start = next(c for c in commands if c[0] == "compose" and "up" in c)
+        assert start[-5:] == ["-d", "--wait", "--wait-timeout", "600", "whisper-bench"]
+        stop = next(c for c in commands if c[0] == "compose" and "stop" in c)
+        assert stop[-1] == "whisper-bench"
+        assert commands.index(start) < commands.index(client) < commands.index(stop)
+        artifacts_run = next(c for c in commands if c[0] == "run")
+        assert "benchmark.artifacts" in artifacts_run and "NVIDIA_VISIBLE_DEVICES=void" in artifacts_run
+        assert artifacts_run[-1] == str(returncode) and commands.index(stop) < commands.index(artifacts_run)
     if whisper_download_exit:
-        assert "whisper-api" not in commands and "'up', '-d', '--wait', '--wait-timeout', '600', 'whisper-bench'" not in commands
+        assert not any(c[0] == "compose" and "up" in c for c in commands)
         download_logs = list((folder / "benchmark-results").glob("*/логи/загрузка-whisper.log"))
         assert len(download_logs) == 1
         assert "полный журнал завершённого контейнера" in download_logs[0].read_text()
     if precheck_failed or client_build_exit:
-        assert "whisper-api" not in commands
-        assert "file changed as we read it" not in result.stdout + result.stderr
+        assert "file changed as we read it" not in launch_log
         archives = list((folder / "benchmark-results").glob("*/диагностика.tar.gz"))
         assert len(archives) == 1
         with tarfile.open(archives[0]) as archive:
@@ -556,27 +402,58 @@ def test_launcher_never_controls_production_and_does_not_start_gigaam_after_fail
             log_text = archive.extractfile("./логи/запуск.log").read().decode()
             assert ("Стенд не запускается" if precheck_failed else f"Завершение: код {client_build_exit}") in log_text
         assert not list((folder / "benchmark-results").glob("*.tar.part"))
-    for line in commands.splitlines():
-        command = ast.literal_eval(line)
-        assert "--rm" not in command and "--remove-orphans" not in command
-        assert "rm" not in command and "down" not in command
-        if command[0] == "compose" and "run" in command:
-            assert "--detach" in command and "--interactive=false" in command and "-T" in command
-    assert "10.220.21.2" not in commands and "WHISPER_API_KEY" not in commands
+    if returncode == 0:
+        assert "Результаты:" in launch_log and "Завершение: код 0" in launch_log
+        assert next((folder / "benchmark-results").glob("*/логи/этап.txt")).read_text().strip() == "Whisper завершён"
     if ignore_log_term:
         assert log_reader_ready.is_file()
         with pytest.raises(ProcessLookupError):
             os.kill(int(log_reader_ready.read_text()), 0)
-        assert "Docker сообщил о завершении задачи speech-comparison-client-" in result.stdout
+        assert "Docker сообщил о завершении задачи speech-comparison-client-" in launch_log
     if blocked_console:
         assert log_reader_ready.is_file()
-        assert "И" * 1024 * 1024 in result.stdout
-        assert len(console) < len(result.stdout)
-        assert "Завершение: код 0" in result.stdout
+        assert "И" * 1024 * 1024 in launch_log
+        assert len(console) < len(launch_log)
+        assert "Завершение: код 0" in launch_log
 
 
-@pytest.mark.parametrize("download_network,batch,cache", [("host", "64", "q8_0"), ("bridge", "128", "f16")])
-def test_download_network_never_reaches_audio_processing_containers(tmp_path, download_network, batch, cache):
+@pytest.mark.parametrize("flag", ["--gigaam-only", "--resume-gigaam", "--skip-full-gigaam"])
+def test_launcher_refuses_removed_gigaam_modes_before_touching_docker(tmp_path, flag):
+    folder, env = fake_stand(tmp_path)
+    refused = subprocess.run(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio"), flag],
+                             env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+    assert refused.returncode == 2 and "run-gigaam-trt.sh" in refused.stderr
+    assert not (tmp_path / "commands.log").exists() and not (folder / "benchmark-results").exists()
+
+
+def test_closed_terminal_stops_own_whisper_and_is_a_failed_run(tmp_path):
+    folder, env = fake_stand(tmp_path)
+    waiting = tmp_path / "client.waiting"
+    env["HANG_CLIENT"] = "1"
+    with (tmp_path / "terminal.log").open("w") as terminal:
+        process = subprocess.Popen(["bash", str(folder / "benchmark" / "run.sh"), str(folder / "audio")], env=env,
+                                   stdin=subprocess.DEVNULL, stdout=terminal, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not waiting.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert waiting.exists()
+            os.killpg(process.pid, signal.SIGHUP)
+            code = process.wait(timeout=15)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+    assert code == 129
+    launch_log = next((folder / "benchmark-results").glob("*/логи/запуск.log")).read_text()
+    assert "Получен SIGHUP" in launch_log and "Завершение: код 129" in launch_log
+    commands = [ast.literal_eval(line) for line in (tmp_path / "commands.log").read_text().splitlines()]
+    assert any(c[0] == "compose" and "stop" in c and c[-1] == "whisper-bench" for c in commands)
+    assert any(c[0] == "stop" and c[-1].startswith("speech-comparison-client-") for c in commands)
+
+
+@pytest.mark.parametrize("download_network", ["host", "bridge"])
+def test_download_network_never_reaches_audio_processing_containers(tmp_path, download_network):
     """Только разбор Compose: без демона Docker, контейнеров и скачивания моделей."""
     docker = shutil.which("docker")
     if docker is None:
@@ -585,46 +462,31 @@ def test_download_network_never_reaches_audio_processing_containers(tmp_path, do
     env = {**os.environ, "BENCH_AUDIO_DIR": str(tmp_path / "audio"), "BENCH_OUT": str(tmp_path / "results"),
            "BENCH_EXPECTED_FILES": "2",
            "BENCH_CACHE": str(tmp_path / "cache"), "BENCH_DOWNLOAD_NETWORK": download_network,
-           "BENCH_BUILD_NETWORK": "default", "BENCH_OLLAMA_DOWNLOAD_PORT": "11435",
-           "BENCH_LLM_NUM_BATCH": batch, "BENCH_LLM_KV_CACHE_TYPE": cache, "LLM_NUM_CTX": "8192",
-           "HF_TOKEN": "", "WHISPER_API_BASE_URL": "http://production.example/v1", "WHISPER_API_KEY": "prod-secret"}
+           "BENCH_BUILD_NETWORK": "default",
+           "WHISPER_API_BASE_URL": "http://production.example/v1", "WHISPER_API_KEY": "prod-secret"}
     parsed = subprocess.run([docker, "compose", "--env-file", "/dev/null", "--project-name", "speech-comparison",
                              "--project-directory", str(project), "-f", str(project / "compose.benchmark.yml"),
                              "config", "--format", "json"], env=env, capture_output=True, text=True, timeout=15)
     assert parsed.returncode == 0, parsed.stderr
     config = json.loads(parsed.stdout)
     services = config["services"]
-    for name in ("whisper-download", "prefetch", "ollama-download"):
+    assert set(services) == {"whisper-client", "whisper-bench", "whisper-download"}
+    assert set(config["networks"]) == {"whisper"} and not config.get("volumes")
+    download = services["whisper-download"]
+    assert download["network_mode"] == download_network and not download.get("networks")
+    assert not download.get("ports") and not download.get("gpus") and not download.get("deploy")
+    assert download["environment"]["NVIDIA_VISIBLE_DEVICES"] == "void"
+    assert all(mount["target"] != "/recordings" for mount in download.get("volumes", []))
+    for name in ("whisper-client", "whisper-bench"):
         service = services[name]
-        assert service["network_mode"] == download_network and not service.get("networks")
-        assert not service.get("ports") and not service.get("gpus") and not service.get("deploy")
-        assert service["environment"]["NVIDIA_VISIBLE_DEVICES"] == "void"
-        assert all(mount["target"] != "/recordings" for mount in service.get("volumes", []))
-    for name, network in (("whisper-client", "whisper"), ("whisper-bench", "whisper"), ("compare", "gigaam"), ("ollama", "gigaam")):
-        service = services[name]
-        assert not service.get("network_mode") and set(service["networks"]) == {network}
-        assert config["networks"][network]["internal"] is True
+        assert not service.get("network_mode") and set(service["networks"]) == {"whisper"}
         assert not service.get("ports")
+    assert config["networks"]["whisper"]["internal"] is True
     client = services["whisper-client"]["environment"]
     assert client["WHISPER_API_BASE_URL"] == TEST_URL and "WHISPER_API_KEY" not in client
-    assert services["ollama-download"]["environment"]["OLLAMA_HOST"] == "127.0.0.1:11435"
-    assert services["ollama-download"]["healthcheck"]["test"] == ["CMD", "ollama", "list"]
-    for name in ("audio-prepare", "whisper-client", "compare"):
-        assert services[name]["environment"]["BENCH_LLM_NUM_BATCH"] == batch
-        assert services[name]["environment"]["BENCH_LLM_KV_CACHE_TYPE"] == cache
-        assert services[name]["environment"]["LLM_NUM_CTX"] == "8192"
-    for name in ("audio-prepare", "whisper-client", "compare", "first-line"):
-        assert services[name]["environment"]["BENCH_EXPECTED_FILES"] == "2"
-    assert services["ollama"]["environment"]["OLLAMA_KV_CACHE_TYPE"] == cache
-    assert services["ollama"]["environment"]["OLLAMA_FLASH_ATTENTION"] == "1"
-    assert "OLLAMA_KV_CACHE_TYPE" not in services["ollama-download"]["environment"]
-    first_line = services["first-line"]
-    assert first_line["network_mode"] == "none" and not first_line.get("depends_on")
-    assert not first_line.get("ports") and not first_line.get("networks")
-    assert first_line["deploy"] == services["compare"]["deploy"]
-    for key in ("VAD_THRESHOLD", "VAD_MIN_SILENCE", "VAD_MIN_SPEECH", "VAD_MAX_SPEECH", "BENCH_THREADS"):
-        assert first_line["environment"][key] == services["compare"]["environment"][key]
-    assert all(first_line["environment"][key] == "false" for key in ("EMO_ENABLED", "LLM_ENABLED", "SPLIT_TURNS"))
+    assert client["BENCH_EXPECTED_FILES"] == "2" and not any("LLM" in key for key in client)
+    assert "prod-secret" not in parsed.stdout and "production.example" not in parsed.stdout
+    assert not services["whisper-client"].get("deploy") and services["whisper-bench"]["deploy"]
 
 
 @pytest.mark.parametrize("url", ["http://10.220.21.2:8002/v1", "http://localhost:9000/v1", "https://api.openai.com/v1"])

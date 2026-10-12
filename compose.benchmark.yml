@@ -1,4 +1,4 @@
-# Изолированный файловый стенд. Обычный речевой монитор не запускается.
+# Изолированный стенд Whisper: клиент, собственный сервер и загрузчик весов.
 name: speech-comparison
 
 services:
@@ -31,44 +31,11 @@ services:
       BENCH_API_GAP: ${BENCH_API_GAP:-5}
       BENCH_API_TIMEOUT: ${BENCH_API_TIMEOUT:-1200}
       BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
-      LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
-      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
-      BENCH_LLM_NUM_BATCH: ${BENCH_LLM_NUM_BATCH:-64}
-      BENCH_LLM_KV_CACHE_TYPE: ${BENCH_LLM_KV_CACHE_TYPE:-q8_0}
       TZ: Europe/Moscow
     volumes:
       - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
       - ${BENCH_OUT:?Укажите папку отчётов}:/results
     networks: [whisper]
-
-  audio-prepare:
-    # Тот же PyAV/NumPy, что подготовил WAV для Whisper; без ASR и сети.
-    image: speech-comparison:4.0.0-whisper-standalone
-    platform: linux/amd64
-    entrypoint: ["python", "-m", "benchmark.compare"]
-    command: []
-    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
-    cpus: "${BENCH_THREADS:-4}"
-    cpuset: "${BENCH_CPUSET:-0-3}"
-    mem_limit: 2g
-    network_mode: none
-    environment:
-      NVIDIA_VISIBLE_DEVICES: void
-      BENCH_THREADS: ${BENCH_THREADS:-4}
-      BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
-      BENCH_GPU: ${BENCH_GPU:-0}
-      BENCH_GPU_MIN_FREE_MIB: ${BENCH_GPU_MIN_FREE_MIB:-16384}
-      BENCH_GPU_MAX_UTIL: ${BENCH_GPU_MAX_UTIL:-10}
-      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
-      BENCH_MIN_RAM_MIB: ${BENCH_MIN_RAM_MIB:-20480}
-      LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
-      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
-      BENCH_LLM_NUM_BATCH: ${BENCH_LLM_NUM_BATCH:-64}
-      BENCH_LLM_KV_CACHE_TYPE: ${BENCH_LLM_KV_CACHE_TYPE:-q8_0}
-      TZ: Europe/Moscow
-    volumes:
-      - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
-      - ${BENCH_OUT:?Укажите папку отчётов}:/results
 
   whisper-bench:
     image: speech-comparison:4.0.0-whisper-standalone
@@ -140,145 +107,6 @@ services:
     volumes:
       - ${BENCH_CACHE:?Укажите папку кеша моделей}/whisper:/var/lib/whisper
 
-  compare:
-    build:
-      context: .
-      dockerfile: Dockerfile.benchmark
-      network: ${BENCH_BUILD_NETWORK:-default}
-      args:
-        WHISPER_IMAGE: ${BENCH_WHISPER_IMAGE:-hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6}
-    image: speech-comparison:4.0.0-gigaam-cuda
-    platform: linux/amd64
-    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
-    cpus: "${BENCH_THREADS:-4}"
-    cpuset: "${BENCH_CPUSET:-0-3}"
-    mem_limit: ${BENCH_WORKER_MEMORY:-8g}
-    environment: &gigaam-environment
-      BENCH_THREADS: ${BENCH_THREADS:-4}
-      BENCH_EXPECTED_FILES: ${BENCH_EXPECTED_FILES:-100}
-      PYTHONFAULTHANDLER: "1"
-      OMP_NUM_THREADS: ${BENCH_THREADS:-4}
-      MKL_NUM_THREADS: ${BENCH_THREADS:-4}
-      OPENBLAS_NUM_THREADS: ${BENCH_THREADS:-4}
-      BENCH_GPU: ${BENCH_GPU:-0}
-      CUDA_VISIBLE_DEVICES: "0"
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      HF_TOKEN: ${HF_TOKEN:-}
-      HF_HUB_OFFLINE: "1"
-      HF_HUB_DISABLE_TELEMETRY: "1"
-      BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-4096}
-      OLLAMA_URL: http://ollama:11434
-      LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
-      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
-      LLM_AUTOPULL: "false"
-      BENCH_LLM_NUM_BATCH: ${BENCH_LLM_NUM_BATCH:-64}
-      BENCH_LLM_KV_CACHE_TYPE: ${BENCH_LLM_KV_CACHE_TYPE:-q8_0}
-      VAD_THRESHOLD: ${VAD_THRESHOLD:-0.5}
-      VAD_MIN_SILENCE: ${VAD_MIN_SILENCE:-0.45}
-      VAD_MIN_SPEECH: ${VAD_MIN_SPEECH:-0.25}
-      VAD_MAX_SPEECH: ${VAD_MAX_SPEECH:-15}
-      SPEAKER_THRESHOLD: ${SPEAKER_THRESHOLD:-0.45}
-      MAX_SPEAKERS: ${MAX_SPEAKERS:-5}
-      SPLIT_TURNS: ${SPLIT_TURNS:-true}
-      TZ: Europe/Moscow
-    volumes:
-      - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
-      - ${BENCH_OUT:?Укажите папку отчётов}:/results
-      - ${BENCH_CACHE:?Укажите папку кеша моделей}:/cache
-    depends_on:
-      - ollama
-    networks: [gigaam]
-    deploy: &gigaam-gpu
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${BENCH_GPU:-0}"]
-              capabilities: [gpu]
-
-  first-line:
-    # Тот же образ/вход/ресурсы, без сети и зависимости от Ollama.
-    image: speech-comparison:4.0.0-gigaam-cuda
-    platform: linux/amd64
-    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
-    cpus: "${BENCH_THREADS:-4}"
-    cpuset: "${BENCH_CPUSET:-0-3}"
-    mem_limit: ${BENCH_WORKER_MEMORY:-8g}
-    network_mode: none
-    environment:
-      <<: *gigaam-environment
-      EMO_ENABLED: "false"
-      LLM_ENABLED: "false"
-      SPLIT_TURNS: "false"
-    volumes:
-      - ${BENCH_AUDIO_DIR:?Укажите папку записей}:/recordings:ro
-      - ${BENCH_OUT:?Укажите папку отчётов}:/results
-      - ${BENCH_CACHE:?Укажите папку кеша моделей}:/cache
-    deploy: *gigaam-gpu
-
-  ollama:
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
-    cpus: "${BENCH_THREADS:-4}"
-    cpuset: "${BENCH_CPUSET:-0-3}"
-    mem_limit: ${BENCH_LLM_MEMORY:-10g}
-    environment:
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
-      CUDA_VISIBLE_DEVICES: "0"
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      OLLAMA_FLASH_ATTENTION: "1"
-      OLLAMA_KV_CACHE_TYPE: ${BENCH_LLM_KV_CACHE_TYPE:-q8_0}
-      OLLAMA_NO_CLOUD: "1"
-    networks: [gigaam]
-    volumes:
-      - comparison-ollama:/root/.ollama
-    # Та же GPU, что у compare; порт доступен только внутри стенда.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${BENCH_GPU:-0}"]
-              capabilities: [gpu]
-
-  prefetch:
-    image: speech-comparison:4.0.0-gigaam-cuda
-    user: "${BENCH_UID:-1000}:${BENCH_GID:-1000}"
-    cpus: "${BENCH_THREADS:-4}"
-    cpuset: "${BENCH_CPUSET:-0-3}"
-    mem_limit: 8g
-    network_mode: ${BENCH_DOWNLOAD_NETWORK:-host}
-    entrypoint: ["python", "-m", "benchmark.prefetch"]
-    environment:
-      NVIDIA_VISIBLE_DEVICES: void
-      EMO_CACHE: /cache/gigaam
-      HF_HUB_DISABLE_TELEMETRY: "1"
-    volumes:
-      - ${BENCH_CACHE:?Укажите папку кеша моделей}:/cache
-
-  ollama-download:
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
-    mem_limit: 2g
-    network_mode: ${BENCH_DOWNLOAD_NETWORK:-host}
-    environment:
-      NVIDIA_VISIBLE_DEVICES: void
-      # При host-сети API подготовки слушает только loopback и другой порт.
-      OLLAMA_HOST: "127.0.0.1:${BENCH_OLLAMA_DOWNLOAD_PORT:-11435}"
-      OLLAMA_NO_CLOUD: "1"
-      LLM_MODEL: ${LLM_MODEL:-hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:Q4_K_M}
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
-    volumes:
-      - comparison-ollama:/root/.ollama
-
 networks:
   whisper:
     internal: true
-  gigaam:
-    internal: true
-
-volumes:
-  comparison-ollama:

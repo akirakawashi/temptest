@@ -192,7 +192,7 @@ class TensorRTPipeline:
             "raw_start": p.start_time, "raw_end": p.end_time} for p in raw_phrases]
         return {"engine": "tone", "system": self.system, "pipeline": "official_tone_triton_tensorrt",
             "status": status, "error": error, "text": "\n".join(p["text"] for p in phrases if p["text"].strip()),
-            "elapsed_seconds": elapsed, "asr_seconds": elapsed, "llm_seconds": 0., "analysis": None,
+            "elapsed_seconds": elapsed, "asr_seconds": elapsed,
             "acoustic_rpc_seconds": stages["acoustic"]["seconds"],
             "triton_requests": acoustic.requests, "trt_stages": stages, "stage_calls": list(self.timer.calls),
             "stages": {"asr": {"seconds": elapsed, "calls": 1, "errors": int(error is not None)}},

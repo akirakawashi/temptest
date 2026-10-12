@@ -12,7 +12,7 @@ import time
 import json
 
 from benchmark.compare import Audio, read_audio, setup_logging
-from benchmark.tone_run import save_json
+from benchmark.trt_common import save_json
 from benchmark.tone_trt_prepare import gpu_snapshot
 
 log = logging.getLogger("тестовый-t-one-trt")

@@ -16,10 +16,9 @@ EXCLUDED = {"__pycache__", ".pytest_cache", ".venv", ".env"}
 
 def source_files() -> list[Path]:
     paths = [ROOT / name for name in (
-        "Dockerfile.benchmark", "Dockerfile.whisper-client", "compose.benchmark.yml", "requirements.txt", ".dockerignore",
-        "Dockerfile.tone-benchmark", "compose.tone-benchmark.yml",
-        "Dockerfile.tone-trt-benchmark", "compose.tone-trt-benchmark.yml",
-        "scripts/download_models.sh",
+        "Dockerfile.whisper-client", "compose.benchmark.yml", ".dockerignore",
+        "Dockerfile.benchmark", "compose.trt-base.yml", "requirements.txt", "scripts/download_models.sh",
+        "Dockerfile.tone-trt-benchmark", "compose.tone-trt-benchmark.yml", "compose.gigaam-trt-benchmark.yml",
     )]
     for folder in ("app", "benchmark"):
         for path in (ROOT / folder).rglob("*"):
@@ -43,7 +42,7 @@ def main() -> None:
     paths = source_files()
     manifest = {
         "format_version": 1,
-        "description": "Отдельный Whisper large-v3 и полный цикл GigaAM: CUDA-стенд",
+        "description": "Стенд распознавания: Whisper large-v3, GigaAM и T-one через TensorRT",
         "audio_included": False,
         "model_cache_included": False,
         "files": [{"path": str(path.relative_to(ROOT)), "size_bytes": path.stat().st_size,

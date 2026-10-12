@@ -1,0 +1,13 @@
+# Общие библиотеки клиентов TensorRT: PyTorch, gigaam, ONNX Runtime, PyAV. Только сборка образа.
+name: speech-comparison-trt-base
+
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile.benchmark
+      network: ${BENCH_BUILD_NETWORK:-default}
+      args:
+        WHISPER_IMAGE: ${BENCH_WHISPER_IMAGE:-hwdsl2/whisper-server@sha256:de716f26601229179eb4ba62d07e7a5ed4167c5290786281cd06535fdf2a97d6}
+    image: speech-comparison:4.0.0-gigaam-cuda
+    platform: linux/amd64

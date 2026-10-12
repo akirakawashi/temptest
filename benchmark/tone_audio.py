@@ -1,4 +1,4 @@
-"""Общий фильтр 16 → 8 кГц для обоих вариантов теста T-one."""
+"""Фильтр 16 → 8 кГц для T-one: модель принимает звук 8 кГц."""
 from __future__ import annotations
 
 import numpy as np
