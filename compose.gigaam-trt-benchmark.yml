@@ -116,9 +116,11 @@ services:
     mem_limit: ${BENCH_CLIENT_MEMORY:-8g}
     networks: [gigaam]
     environment:
-      # utility — nvidia-smi для замеров памяти; compute нужен только поиску речи при BENCH_VAD_PROVIDER=cuda.
+      # utility — nvidia-smi для замеров памяти; compute нужен эмоциям полного flow и поиску речи при BENCH_VAD_PROVIDER=cuda.
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       BENCH_VAD_PROVIDER: ${BENCH_VAD_PROVIDER:-cpu}
+      BENCH_SPEAKER_PROVIDER: ${BENCH_SPEAKER_PROVIDER:-cpu}
+      EMO_CACHE: /weights
       BENCH_THREADS: ${BENCH_THREADS:-4}
       BENCH_TRITON_INSTANCES: ${BENCH_TRITON_INSTANCES:-1}
       BENCH_GPU: ${BENCH_GPU:-0}
@@ -137,6 +139,8 @@ services:
       - ${BENCH_AUDIO_DIR:?Нужна папка аудио}:/recordings:ro
       - ${BENCH_RUN_OUT:?Нужна папка прогона}:/results
       - ${BENCH_CACHE:?Нужна папка кеша}/gigaam-trt:/cache:ro
+      # Веса эмоций для полного flow; скачивает и проверяет их подготовка.
+      - ${BENCH_CACHE:?Нужна папка кеша}/gigaam:/weights:ro
       - ${BENCH_REFERENCE_DIR:?Нужна папка исходного прогона}:/reference:ro
     entrypoint: [python, -m, benchmark.gigaam_trt_run]
     deploy: *gpu

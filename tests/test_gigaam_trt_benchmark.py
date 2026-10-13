@@ -210,6 +210,77 @@ def test_pipeline_refuses_speakers_emotions_and_llm(tmp_path):
         gigaam_trt.GigaTrtPipeline(Settings(emo_enabled=True, llm_enabled=False, split_turns=False), 1, 3, tmp_path)
     with pytest.raises(ValueError):
         gigaam_trt.GigaTrtPipeline(Settings(emo_enabled=False, llm_enabled=True, split_turns=False), 1, 3, tmp_path)
+    with pytest.raises(ValueError):
+        gigaam_trt.GigaTrtPipeline(Settings(emo_enabled=False, llm_enabled=False, split_turns=True), 1, 3, tmp_path)
+    # Полному flow нужны эмоции; языковой модели нет и в нём.
+    with pytest.raises(ValueError, match="без LLM"):
+        gigaam_trt.GigaTrtFullPipeline(Settings(emo_enabled=True, llm_enabled=True), 1, 3, tmp_path)
+    with pytest.raises(ValueError, match="с эмоциями"):
+        gigaam_trt.GigaTrtFullPipeline(Settings(emo_enabled=False, llm_enabled=False), 1, 3, tmp_path)
+
+
+class FakeVoices:
+    """Заглушка CAM++: один и тот же голос на любой отрезок."""
+    dim = 192
+
+    def __init__(self):
+        self.lengths = []
+
+    def create_stream(self):
+        return SimpleNamespace(accept_waveform=lambda rate, samples: self.lengths.append(len(samples)), input_finished=lambda: None)
+
+    def is_ready(self, stream):
+        return True
+
+    def compute(self, stream):
+        return np.ones(self.dim, dtype=np.float32)
+
+
+def test_full_flow_adds_speakers_and_emotions_to_the_same_recognition(tmp_path, monkeypatch):
+    from test_benchmark import ScriptedVad, speech
+    from app.vad import StreamingVad
+
+    async def scenario():
+        monkeypatch.delenv("BENCH_SPEAKER_PROVIDER", raising=False)
+        runner = gigaam_trt.GigaTrtFullPipeline(Settings(emo_enabled=True, llm_enabled=False, split_turns=True), 1, 3, tmp_path)
+        engines = runner.engines
+        fakes = engines_with_fakes(tmp_path)
+        engines.features, engines.encoder, engines.decoder, engines.tokenizer = fakes.features, fakes.encoder, fakes.decoder, fakes.tokenizer
+        for pool in (fakes.asr_pool, fakes.emo_pool, fakes.live_pool):
+            pool.shutdown()
+        engines.new_vad = lambda: pipeline.TimedVad(StreamingVad(ScriptedVad()), engines.timer)
+        assert engines.components["llm"].state == "off" and engines.components["spk"].state != "off"
+        for key in ("vad", "asr"):
+            engines._set(key, "ready")
+        assert engines.core_ready is False  # без модели голосов полный flow не готов
+        engines._set("spk", "ready")
+        voices = engines._spk = FakeVoices()
+        engines._emo = object()
+        engines._emotion_probabilities = lambda samples: {"neutral": .9, "positive": .1}
+        # Отрезок короче 0,4 с голосу не отдаётся и в замер не попадает.
+        assert engines.embed(np.zeros(1000, dtype=np.float32)) is None and not voices.lengths
+        try:
+            result = await runner.run(speech())
+            assert result["status"] == "ok" and result["system"] == "gigaam_trt_full"
+            assert result["pipeline"] == "vad_gigaam_tensorrt_speaker_emotion"
+            assert result["enabled_stages"] == ["vad", "asr", "speaker", "emotion"]
+            assert result["stages"]["speaker"]["calls"] == len(voices.lengths) >= 1 and result["stages"]["emotion"]["calls"] == 1
+            assert result["text"] == "Добрый день." and result["dialog"] == "[00:00] Собеседник 1 (нейтрально): Добрый день."
+            utterance = result["utterances"][0]
+            assert utterance["speaker"] == 1 and utterance["emotion"]["label"] == "neutral"
+            assert result["speakers"] == 1 and result["emotions_skipped_short"] == 0 and result["speaker_provider"] == "cpu"
+            assert [event["type"] for event in result["events"]] == ["utterance", "emotion"]
+            assert {call["stage"] for call in result["stage_calls"]} == {"vad", "asr", "speaker", "emotion"}
+            assert set(result["timing"]["exclusive_wall_seconds"]) == {"vad", "asr", "speaker", "emotion", "parallel", "other"}
+            assert sum(result["timing"]["exclusive_wall_percent"].values()) == pytest.approx(100)
+            assert result["trt_stages"]["encoder"]["calls"] == result["stages"]["asr"]["calls"] and result["pauses"]
+            # Сбой эмоций — ошибка записи, а не тихий пропуск.
+            engines._emotion_probabilities = lambda samples: (_ for _ in ()).throw(RuntimeError("Нет видеопамяти"))
+            failed = await runner.run(speech())
+            assert failed["status"] == "error" and "Нет видеопамяти" in failed["error"] and failed["stages"]["emotion"]["errors"] == 1
+        finally:
+            runner.shutdown()
+    asyncio.run(scenario())
 
 
 def test_pipeline_keeps_the_reduced_flow_and_reports_tensorrt_parts(tmp_path, monkeypatch):
@@ -315,7 +386,7 @@ def fake_audio(source, target, max_seconds=None):
     return Audio(str(source), str(target), 1., 16000, hashlib.sha256(pcm).hexdigest(), .01, 1, 16000, source.stat().st_size)
 
 
-def args_for(tmp_path):
+def args_for(tmp_path, *flags):
     audio, output, cache = tmp_path / "audio", tmp_path / "out", tmp_path / "cache"
     audio.mkdir(); output.mkdir(); cache.mkdir()
     for name in ("a.wav", "b.wav"):
@@ -324,8 +395,7 @@ def args_for(tmp_path):
             wav.writeframes(np.zeros(16000, dtype="<i2").tobytes())
     (cache / "движок.json").write_text(json.dumps({"fingerprint": {"gpu": {"uuid": "GPU-1"}}}))
     (cache / "артефакты.json").write_text("{}")
-    from benchmark.trt_common import parser
-    return parser().parse_args([str(audio), "--out", str(output), "--model-dir", str(cache)])
+    return gigaam_trt_run.arguments().parse_args([str(audio), "--out", str(output), "--model-dir", str(cache), *flags])
 
 
 @pytest.mark.parametrize("fail_first", [False, True])
@@ -474,6 +544,73 @@ def test_worker_keeps_load_and_warmup_outside_measurement(monkeypatch, tmp_path)
     assert (tmp_path / "gigaam_trt-прогрев.json").is_file()
 
 
+def test_worker_runs_the_full_flow_with_speakers_and_emotions_but_without_llm(monkeypatch, tmp_path):
+    class Pipeline:
+        def __init__(self, cfg, threads, timeout, cache):
+            assert cfg.emo_enabled and cfg.split_turns and not cfg.llm_enabled and cfg.vad_max_speech == 15.
+            self.engines = SimpleNamespace(versions={}, server_metadata={}, model_metadata={}, config={},
+                engine_metadata={"engine_sha256": "verified"}, placement=lambda: {"speaker": "CAM++"})
+        async def load(self): pass
+        async def run(self, samples):
+            stage = {"seconds": .1, "calls": 2, "errors": 0}
+            return {"status": "ok", "elapsed_seconds": .5, "asr_seconds": .2, "text": "Добрый день.", "speakers": 1,
+                    "triton_requests": 0, "trt_stages": {}, "utterances": [], "stages": {"speaker": stage, "emotion": stage}}
+        def statistics(self): return {}
+        def close(self): pass
+    monkeypatch.setattr(gigaam_trt, "GigaTrtFullPipeline", Pipeline)
+    monkeypatch.setattr(gigaam_trt, "GigaTrtPipeline", lambda *a: pytest.fail("Урезанный flow здесь не нужен"))
+    monkeypatch.setattr(gigaam_trt_worker, "gpu_snapshot", lambda: {"free_mib": 10000})
+    monkeypatch.setattr(gigaam_trt_worker, "read_audio", lambda x: np.zeros(16000, dtype=np.float32))
+    audio = asdict(Audio("input", "prepared", 1., 16000, "sha", .01))
+    payload = asyncio.run(gigaam_trt_worker.execute({"system": "gigaam_trt_full", "output": str(tmp_path), "threads": 1,
+        "model_dir": "/cache", "timeout": 3, "audio": audio, "warmup": audio, "protocol": {}, "parallel": 2,
+        "vad_settings": {"vad_threshold": .5, "vad_min_silence": .45, "vad_min_speech": .25, "vad_max_speech": 15.}}))
+    assert payload["result"]["status"] == "ok", payload["result"]["error"]
+    assert payload["preparation"]["enabled_stages"] == ["vad", "asr", "speaker", "emotion"]
+    assert (tmp_path / "gigaam_trt_full-прогрев.json").is_file()
+
+
+def test_full_corpus_reports_speakers_and_emotions_under_its_own_name(monkeypatch, tmp_path):
+    args = args_for(tmp_path, "--full")
+    for name in ("BENCH_VAD_PROVIDER", "BENCH_SPEAKER_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("benchmark.trt_common.prepare_audio", fake_audio)
+    monkeypatch.setattr(gigaam_trt_run, "gpu_snapshot", lambda: {"uuid": "GPU-1"})
+    dialog = "[00:00] Собеседник 1 (нейтрально): Добрый день."
+    async def worker(request):
+        assert request["system"] == "gigaam_trt_full"
+        stages = {key: {"seconds": .2, "calls": 3, "errors": 0} for key in pipeline.FULL_STAGES}
+        keys = (*pipeline.FULL_STAGES, "parallel", "other")
+        return {"result": {"status": "ok", "text": "Добрый день.", "dialog": dialog, "speakers": 1, "elapsed_seconds": .8,
+            "asr_seconds": .2, "error": None, "stages": stages, "pause_seconds": .5, "triton_requests": 1,
+            "timing": {"exclusive_wall_seconds": {key: .1 for key in keys}, "exclusive_wall_percent": {key: 100 / 6 for key in keys}},
+            "trt_stages": {key: {"seconds": .05, "calls": 1, "errors": 0} for key in preparation.TRT_STAGES}},
+            "preparation": {"system": request["system"], "load_seconds": 4., "warmup_seconds": 1.}}
+    monkeypatch.setattr(gigaam_trt_run, "run_worker", worker)
+    assert asyncio.run(gigaam_trt_run.run(args)) == 0
+    conditions = json.loads((args.out / "условия.json").read_text())
+    summary = json.loads((args.out / "итоги.json").read_text())
+    entry = summary["systems"]["gigaam_trt_full"]
+    assert conditions["mode"] == "gigaam_tensorrt_full" and conditions["planned_systems"] == ["gigaam_trt_full"]
+    assert conditions["speaker_provider"] == "cpu" and conditions["protocol"]["disabled_stages"] == ["llm"]
+    assert entry["label"] == "GigaAM TensorRT с голосами и эмоциями" and entry["statuses"]["ok"] == 2
+    assert set(entry["stages"]) == {"vad", "asr", "speaker", "emotion"} and entry["stages"]["speaker"]["calls"] == 6
+    assert entry["stages"]["emotion"]["seconds"]["total"] == pytest.approx(.4) and "speaker" in entry["mean_record_wall_percent"]
+    header = (args.out / "замеры.csv").read_text(encoding="utf-8-sig").splitlines()[0]
+    assert "Голоса, с" in header and "Эмоции, вызовов" in header and "Собеседников" in header and "Паузы, с" in header
+    notes = " ".join(summary["notes"])
+    assert "CAM++ на CPU" in notes and "Языковая модель не запускается" in notes
+    # Обычный текст — для сравнения слов, диалог — с собеседниками и эмоциями.
+    assert (args.out / "записи/0001/gigaam_trt_full.txt").read_text() == "Добрый день.\n"
+    assert (args.out / "записи/0001/gigaam_trt_full-диалог.txt").read_text() == dialog + "\n"
+    page = (args.out / "отчёт.html").read_text()
+    assert "GigaAM TensorRT с голосами и эмоциями" in page and "Собеседник 1 (нейтрально)" in page and "Голоса собеседников" in page
+    gigaam_trt_run.finalize(args.out, 0)
+    assert json.loads((args.out / "итоги.json").read_text())["systems"]["gigaam_trt_full"]["statuses"]["ok"] == 2
+    with tarfile.open(args.out / "диагностика.tar.gz") as archive:
+        assert "записи/0001/gigaam_trt_full-диалог.txt" in archive.getnames()
+
+
 def test_run_and_prepare_import_without_models_or_numeric_libraries(tmp_path):
     """Завершение на хосте и сборка в образе Triton идут на чистом Python."""
     (tmp_path / "launch.log").write_text("Сборка прервана")
@@ -500,6 +637,10 @@ def test_compose_keeps_audio_off_preparation_and_all_ports_private():
     assert config["services"]["compile"]["network_mode"] == "none"
     assert config["services"]["client"]["volumes"][0].endswith(":ro")
     assert config["services"]["client"]["environment"]["BENCH_VAD_PROVIDER"] == "${BENCH_VAD_PROVIDER:-cpu}"
+    # Веса эмоций клиент только читает; скачивает их подготовка, у которой нет ни аудио, ни GPU.
+    weights = [v for v in config["services"]["client"]["volumes"] if v.endswith("/gigaam:/weights:ro")]
+    assert len(weights) == 1 and config["services"]["client"]["environment"]["EMO_CACHE"] == "/weights"
+    assert config["services"]["client"]["environment"]["BENCH_SPEAKER_PROVIDER"] == "${BENCH_SPEAKER_PROVIDER:-cpu}"
     client, triton = config["services"]["client"], config["services"]["triton"]
     assert client["cpus"] == triton["cpus"] == "${BENCH_CLIENT_CPUS:-4}" and client["cpuset"] == triton["cpuset"]
     assert client["mem_limit"] == "${BENCH_CLIENT_MEMORY:-8g}"
@@ -624,7 +765,8 @@ elif args[0]=='inspect':
     env = {**os.environ, "PATH": str(binary) + ":" + os.environ["PATH"], "FAKE_COMMANDS": str(commands), "FAKE_ROOT": str(tmp_path),
         "BENCH_OUT": str(tmp_path / "results"), "BENCH_CACHE": str(tmp_path / "cache"),
         "BENCH_GPU_MAX_UTIL": "100", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0", **extra}
-    for name in ("BENCH_VAD_PROVIDER", "BENCH_GPU_MIN_FREE_MIB", "BENCH_CLIENT_CPUS", "BENCH_CPUSET", "BENCH_CLIENT_MEMORY", "BENCH_TRITON_INSTANCES"):
+    for name in ("BENCH_VAD_PROVIDER", "BENCH_SPEAKER_PROVIDER", "BENCH_EMOTION_VRAM_MIB", "BENCH_GPU_RESERVE_MIB", "BENCH_GPU_MIN_FREE_MIB",
+                 "BENCH_CLIENT_CPUS", "BENCH_CPUSET", "BENCH_CLIENT_MEMORY", "BENCH_TRITON_INSTANCES"):
         if name not in extra:
             env.pop(name, None)
     launched = subprocess.run(["bash", str(ROOT / "benchmark" / script), str(audio), *arguments], env=env, capture_output=True, text=True, timeout=30)
@@ -642,6 +784,29 @@ def test_five_parallel_streams_get_cores_memory_and_model_copies(tmp_path, scrip
     compile_run, client = runs[1], runs[-1]
     assert compile_run[compile_run.index("--instances") + 1] == copies
     assert client[client.index("--parallel") + 1] == "5" and client.count("--parallel") == 1
+
+
+def test_full_flow_launch_prepares_emotion_weights_and_sizes_memory_per_stream(tmp_path):
+    launched, runs = fake_launch(tmp_path, "run-gigaam-trt.sh", "--full", "--parallel", "2", "--max-audio-seconds", "14400")
+    assert launched.returncode == 0, launched.stdout + launched.stderr
+    assert "голоса собеседников и эмоции; LLM не запускается" in launched.stdout and "CAM++ на cpu" in launched.stdout
+    # Резерв 3072 + сервер моделей 2048 + по 1536 на поток.
+    assert "нужно свободной видеопамяти: 8192 МиБ" in launched.stdout and "память клиента: 12g." in launched.stdout
+    export, client = runs[0], runs[-1]
+    assert export[-1] == "--emotions" and client.count("--full") == 1 and client[-2:] == ["--max-audio-seconds", "14400"]
+    assert all("-gigaam-trt-full-" in cmd[cmd.index("--name") + 1] for cmd in runs)
+    assert list((tmp_path / "results").glob("gigaam-trt-full-*/логи/запуск.log"))
+
+
+def test_full_flow_is_refused_when_video_memory_cannot_hold_a_model_per_stream(tmp_path):
+    launched, runs = fake_launch(tmp_path, "run-gigaam-trt.sh", "--full", "--parallel", "2", BENCH_EMOTION_VRAM_MIB="8000")
+    assert launched.returncode == 42 and not runs
+    assert "нужно 21120 МиБ свободной видеопамяти" in launched.stdout and "Уменьшите --parallel" in launched.stdout
+    # Урезанному flow модель эмоций не нужна: та же настройка его не останавливает.
+    other = tmp_path / "reduced"
+    other.mkdir()
+    launched, runs = fake_launch(other, "run-gigaam-trt.sh", "--parallel", "2", BENCH_EMOTION_VRAM_MIB="8000")
+    assert launched.returncode == 0 and "--emotions" not in runs[0] and "--full" not in runs[-1]
 
 
 @pytest.mark.parametrize("script", ["run-gigaam-trt.sh", "run-tone-trt.sh"])

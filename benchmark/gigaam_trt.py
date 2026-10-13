@@ -14,9 +14,10 @@ import numpy as np
 from app.config import SAMPLE_RATE, Settings
 from app.engines import Engines
 from app.vad import StreamingVad, default_model_path, make_onnx_session
-from benchmark.gigaam_trt_prepare import (FEATURES, HIDDEN, LABEL, MAX_FRAMES, MIN_FRAMES, MODEL, MODEL_NAME,
-                                          SYSTEM, TRT_STAGES, VAD_PROVIDERS, vad_provider)
-from benchmark.pipeline import FirstLinePipeline, StageTimer, TimedVad
+from benchmark.gigaam_trt_prepare import (EMOTION_MODEL, FEATURES, FULL_SYSTEM, HIDDEN, LABEL, MAX_FRAMES, MIN_FRAMES,
+                                          MODEL, MODEL_NAME, SYSTEM, TRT_STAGES, VAD_PROVIDERS, speaker_provider,
+                                          vad_provider)
+from benchmark.pipeline import FULL_STAGES, STAGES, FirstLinePipeline, FullPipeline, StageTimer, TimedVad
 
 log = logging.getLogger("gigaam-tensorrt")
 ENDPOINT, VERSION = "triton:8001", "1"
@@ -116,20 +117,21 @@ class GreedyDecoder:
 
 
 class GigaTrtEngines(Engines):
-    def __init__(self, cfg: Settings, cache: Path, timeout: int):
+    def __init__(self, cfg: Settings, cache: Path, timeout: int, full: bool = False):
         super().__init__(cfg)
-        self.cache, self.timeout = cache, timeout
+        self.cache, self.timeout, self.full = cache, timeout, full
         self.components["asr"].model = "GigaAM-v3 e2e RNNT (TensorRT, Triton)"
-        self.timer, self.sub = StageTimer(), SubTimer()
+        self.timer, self.sub = StageTimer(FULL_STAGES if full else STAGES), SubTimer()
         self.client = self.encoder = self.decoder = None
         self.skipped_short = 0
         self.vad_provider = vad_provider()
-        for key in ("spk", "emo", "llm"):
-            self._set(key, "off", "Отключено: только поиск речи и распознавание")
+        self.speaker_provider = speaker_provider() if full else None
+        for key in ("llm",) if full else ("spk", "emo", "llm"):
+            self._set(key, "off", "Отключено в этом тесте")
 
     @property
     def core_ready(self) -> bool:
-        return all(self.components[key].state == "ready" for key in ("vad", "asr"))
+        return all(self.components[key].state == "ready" for key in (("vad", "asr", "spk") if self.full else ("vad", "asr")))
 
     def load_core(self) -> None:
         import hydra
@@ -180,6 +182,26 @@ class GigaTrtEngines(Engines):
         self._set("asr", "ready", "Энкодер TensorRT GPU:0; декодер CPU", time.perf_counter() - started)
         log.info("%s подготовлен: энкодер TensorRT GPU:0; признаки и декодер CPU; поиск речи %s",
                  LABEL, self._vad_sess.get_providers()[0])
+        if self.full:
+            self.load_voices_and_emotions()
+
+    def load_voices_and_emotions(self) -> None:
+        import gigaam
+        import sherpa_onnx
+
+        started = time.perf_counter()
+        self._spk = sherpa_onnx.SpeakerEmbeddingExtractor(sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=self.cfg.spk_model, num_threads=self.cfg.spk_threads, provider=self.speaker_provider))
+        self.versions["sherpa-onnx"] = importlib.metadata.version("sherpa-onnx")
+        self._set("spk", "ready", f"CAM++: {self.speaker_provider}, вектор {self._spk.dim}", time.perf_counter() - started)
+        started = time.perf_counter()
+        # Веса проверены на подготовке; здесь они только читаются. Энкодер эмоций — PyTorch fp16 на той же GPU.
+        self._emo = gigaam.load_model(EMOTION_MODEL, device="cuda:0", fp16_encoder=True, use_flash=False,
+                                      download_root=self.cfg.emo_cache)
+        self._emotion_probabilities(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        self._set("emo", "ready", "GigaAM-Emo: PyTorch GPU:0, fp16", time.perf_counter() - started)
+        log.info("Голоса: CAM++ на %s, потоков %d; эмоции: GigaAM-Emo на GPU:0",
+                 self.speaker_provider, self.cfg.spk_threads)
 
     def new_vad(self):
         return TimedVad(StreamingVad(self._vad_sess, threshold=self.cfg.vad_threshold,
@@ -208,18 +230,46 @@ class GigaTrtEngines(Engines):
                     [float(frame * shift) for frame in emitted])
         return self.timer.measure("asr", recognize, audio_seconds=len(samples) / SAMPLE_RATE)
 
+    def embed(self, samples):
+        if len(samples) < int(.4 * SAMPLE_RATE):
+            return None  # как в исходном мониторе: по такому отрезку голос не определяется
+        return self.timer.measure("speaker", lambda: super(GigaTrtEngines, self).embed(samples),
+                                  audio_seconds=len(samples) / SAMPLE_RATE)
+
+    def _emotion_probabilities(self, samples) -> dict:
+        """То же, что GigaAMEmo.get_probs, но из памяти и на GPU; модель обучалась на отрезках до 12 с."""
+        torch, model = self._torch, self._emo
+        with torch.inference_mode():
+            wav = torch.from_numpy(np.ascontiguousarray(samples[:12 * SAMPLE_RATE], dtype=np.float32)).to("cuda:0").unsqueeze(0)
+            length = torch.full([1], wav.shape[-1], device="cuda:0", dtype=torch.int64)
+            encoded, _ = model.forward(wav, length)
+            pooled = torch.nn.functional.avg_pool1d(encoded, kernel_size=encoded.shape[-1]).squeeze(-1)
+            pooled = pooled.to(next(model.head.parameters()).dtype)
+            values = torch.nn.functional.softmax(model.head(pooled)[0], dim=-1).cpu().tolist()
+        return {str(model.id2name[index]): float(value) for index, value in enumerate(values)}
+
+    def emotions(self, samples):
+        return self.timer.measure("emotion", lambda: self._emotion_probabilities(samples),
+                                  audio_seconds=min(len(samples) / SAMPLE_RATE, 12.))
+
     def placement(self) -> dict:
+        extras = ({"speaker": f"CAM++ (sherpa-onnx), {self.speaker_provider}, потоков {self.cfg.spk_threads}",
+                   "emotion": "GigaAM-Emo, PyTorch GPU:0, fp16"} if self.full else
+                  {"speaker": "отключено", "emotion": "отключено"})
         return {"asr": "Энкодер TensorRT, Triton GPU:0; признаки и декодер CPU",
-                "vad": self._vad_sess.get_providers(), "speaker": "отключено", "emotion": "отключено", "llm": "отключено"}
+                "vad": self._vad_sess.get_providers(), **extras, "llm": "отключено"}
 
 
 class GigaTrtPipeline(FirstLinePipeline):
     """Урезанный flow: поиск речи → распознавание → паузы; энкодер в TensorRT."""
 
+    system, pipeline, full = SYSTEM, "vad_gigaam_tensorrt", False
+
     def __init__(self, cfg: Settings, threads: int, timeout: int, cache: Path):
-        if cfg.emo_enabled or cfg.llm_enabled or cfg.split_turns:
-            raise ValueError("GigaAM TensorRT работает без голосов, эмоций и LLM")
-        super().__init__(cfg, GigaTrtEngines(cfg, cache, timeout), timeout)
+        if cfg.llm_enabled or cfg.emo_enabled != self.full or (cfg.split_turns and not self.full):
+            raise ValueError("Полный flow GigaAM TensorRT работает с эмоциями и без LLM" if self.full else
+                             "GigaAM TensorRT работает без голосов, эмоций и LLM")
+        super().__init__(cfg, GigaTrtEngines(cfg, cache, timeout, self.full), timeout)
         self.threads = threads
 
     async def load(self) -> None:
@@ -234,12 +284,20 @@ class GigaTrtPipeline(FirstLinePipeline):
         engines.encoder.requests = engines.skipped_short = 0
         result = await super().run(samples)
         stages = {key: dict(value) for key, value in engines.sub.values.items()}
-        result.update(engine="gigaam", system=SYSTEM, pipeline="vad_gigaam_tensorrt", trt_stages=stages,
+        result.update(engine="gigaam", system=self.system, pipeline=self.pipeline, trt_stages=stages,
                       triton_requests=engines.encoder.requests, encoder_rpc_seconds=stages["encoder"]["seconds"],
                       skipped_short_segments=engines.skipped_short, vad_provider=engines.vad_provider)
+        if self.full:
+            result["speaker_provider"] = engines.speaker_provider
         return result
 
     def close(self) -> None:
         self.shutdown()
         if self.engines.client is not None:
             self.engines.client.close()
+
+
+class GigaTrtFullPipeline(GigaTrtPipeline, FullPipeline):
+    """Полный flow без языковой модели: к распознаванию добавлены голоса собеседников и эмоции."""
+
+    system, pipeline, full = FULL_SYSTEM, "vad_gigaam_tensorrt_speaker_emotion", True

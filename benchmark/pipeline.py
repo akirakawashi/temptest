@@ -1,4 +1,4 @@
-"""Урезанный flow записи: поиск речи → распознавание → паузы. Модели подключает движок."""
+"""Flow записи: поиск речи → распознавание → паузы; в полном — ещё голоса и эмоции. Модели подключает движок."""
 from __future__ import annotations
 
 import asyncio
@@ -13,16 +13,18 @@ from app.config import SAMPLE_RATE, Settings
 from app.session import Session, tokens_to_words, words_text
 
 STAGES = {"vad": "Выделение речи", "asr": "Распознавание речи"}
+FULL_STAGES = {**STAGES, "speaker": "Разделение собеседников", "emotion": "Определение эмоций"}
 
 
 class StageTimer:
-    def __init__(self):
+    def __init__(self, stages=STAGES):
+        self.stages = tuple(stages)
         self.lock = threading.Lock()
         self.reset()
 
     def reset(self) -> None:
         with self.lock:
-            self.values = {stage: {"seconds": 0.0, "calls": 0, "errors": 0} for stage in STAGES}
+            self.values = {stage: {"seconds": 0.0, "calls": 0, "errors": 0} for stage in self.stages}
             self.details = []
             self.segments = []
             self.origin = None
@@ -36,6 +38,8 @@ class StageTimer:
             result = call()
             if stage == "asr":
                 detail.update(text=result[0], tokens=list(result[1]), token_timestamps=list(result[2]))
+            elif stage == "emotion":
+                detail["probabilities"] = result
             return result
         except BaseException:
             failed = True
@@ -85,10 +89,10 @@ class TimedVad:
         return segments
 
 
-def wall_time_breakdown(calls: list[dict], elapsed: float) -> dict:
+def wall_time_breakdown(calls: list[dict], elapsed: float, stages=STAGES) -> dict:
     """Разбивка 100% времени: пересечения вынесены отдельно, двойного счёта нет."""
     boundaries = [(0.0, None, 0), (elapsed, None, 0)]
-    buckets = {key: 0.0 for key in (*STAGES, "parallel", "other")}
+    buckets = {key: 0.0 for key in (*stages, "parallel", "other")}
     for call in calls:
         a = max(0.0, min(elapsed, call["offset_seconds"]))
         b = max(a, min(elapsed, a + call["seconds"]))
@@ -145,16 +149,30 @@ class FirstLineSession(Session):
                                  "end": seg.start / SAMPLE_RATE + w["e"]} for w in words],
             "asr_ms": (time.perf_counter() - started) * 1000, "diar_ms": 0, "_audio": seg.samples}]}
 
-    def transcript(self) -> str:
-        return "\n".join(u["text"] for u in self.utterances)
+
+class FullSession(Session):
+    """Исходная сессия монитора целиком: текст, смена говорящего, голоса, эмоции."""
+
+    def _live_guess(self) -> None:
+        # Подсказка «кто говорит сейчас» нужна живому микрофону; на реплики она не влияет.
+        pass
 
 
 class FirstLinePipeline:
     """Подаёт запись движку как поток и собирает реплики, времена этапов и паузы."""
 
+    session_type = FirstLineSession
+    event_types = frozenset({"utterance", "error"})
+
     def __init__(self, cfg: Settings, engines, timeout: float):
         self.cfg, self.engines, self.timeout = cfg, engines, timeout
         self.events: list[dict] = []
+
+    def verify(self, session: Session) -> None:
+        """Проверка готового разговора до конца замера; урезанному flow проверять нечего."""
+
+    def details(self, session: Session) -> dict:
+        return {}
 
     async def run(self, samples: np.ndarray) -> dict:
         timer = self.engines.timer
@@ -167,12 +185,12 @@ class FirstLinePipeline:
 
         async def emit(event: dict) -> None:
             # Уровень сигнала и промежуточные счётчики интерфейса не нужны в отчёте.
-            if event.get("type") in {"utterance", "error"}:
+            if event.get("type") in self.event_types:
                 self.events.append({"elapsed_seconds": time.perf_counter() - started, **event})
 
         try:
             async with asyncio.timeout(self.timeout):
-                session = FirstLineSession(self.engines, self.cfg, emit)
+                session = self.session_type(self.engines, self.cfg, emit)
                 session.start()
                 # Вход тот же, что у микрофона. Скорость подачи не привязана к часам.
                 pcm = (np.clip(samples, -1, 32767 / 32768) * 32768).astype("<i2")
@@ -184,6 +202,7 @@ class FirstLinePipeline:
                 failures = [e["message"] for e in self.events if e["type"] == "error"]
                 if failures:
                     raise RuntimeError("; ".join(failures))
+                self.verify(session)
                 if not session.utterances:
                     status = "no_speech"
         except TimeoutError:
@@ -198,7 +217,7 @@ class FirstLinePipeline:
         # Снимки результата и запись файлов находятся за границей замера.
         stages = timer.snapshot()
         utterances = list(session.utterances) if session else []
-        transcript = session.transcript() if session else ""
+        details = self.details(session) if session else {}
         counters = session.counters() if session else {}
         calls = timer.trace()
         speech_segments = list(timer.segments)
@@ -207,11 +226,12 @@ class FirstLinePipeline:
             await session.close()
         return {
             "status": status, "elapsed_seconds": elapsed, "asr_seconds": stages["asr"]["seconds"],
-            "enabled_stages": list(STAGES), "stages": stages, "stage_calls": calls, "text": transcript,
+            "enabled_stages": list(timer.stages), "stages": stages, "stage_calls": calls,
+            "text": "\n".join(u["text"] for u in utterances),
             "utterances": utterances, "events": list(self.events), "error": error,
             "counters": counters, "speech_segments": speech_segments, "pauses": pauses,
             "pause_seconds": sum(p["seconds"] for p in pauses),
-            "timing": wall_time_breakdown(calls, elapsed),
+            "timing": wall_time_breakdown(calls, elapsed, timer.stages), **details,
         }
 
     def shutdown(self) -> None:
@@ -221,3 +241,20 @@ class FirstLinePipeline:
         for name in ("_asr", "_spk", "_emo", "_vad_sess"):
             setattr(self.engines, name, None)
         gc.collect()
+
+
+class FullPipeline(FirstLinePipeline):
+    """Тот же flow с голосами собеседников и эмоциями; языковой модели нет."""
+
+    session_type = FullSession
+    event_types = frozenset({"utterance", "emotion", "relabel", "error"})
+
+    def verify(self, session: Session) -> None:
+        missing = [u["id"] for u in session.utterances if u["end"] - u["start"] >= 0.5 and u.get("emotion") is None]
+        if missing:
+            raise RuntimeError(f"Не получены эмоции для реплик: {missing}")
+
+    def details(self, session: Session) -> dict:
+        utterances = session.utterances
+        return {"dialog": session.transcript(), "speakers": len({u["speaker"] for u in utterances}),
+                "emotions_skipped_short": sum(u.get("emotion") is None for u in utterances)}

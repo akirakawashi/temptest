@@ -1,4 +1,4 @@
-"""Одна запись GigaAM TensorRT; загрузка клиента и прогрев отдельно от замера."""
+"""Одна запись GigaAM TensorRT, урезанный или полный flow; загрузка клиента и прогрев отдельно от замера."""
 from __future__ import annotations
 
 import asyncio
@@ -43,12 +43,13 @@ async def execute(request: dict) -> dict:
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[name] = str(request["threads"])
     from app.config import Settings
-    from benchmark.gigaam_trt import MODEL, GigaTrtPipeline
+    from benchmark.gigaam_trt import FULL_SYSTEM, MODEL, GigaTrtFullPipeline, GigaTrtPipeline
 
     directory, system = Path(request["output"]), request["system"]
+    full = system == FULL_SYSTEM
     preparation = {"system": system, "included_in_measurements": False, "pid": os.getpid(),
         "started_at": datetime.now().astimezone().isoformat(), "settings": request["protocol"],
-        "enabled_stages": ["vad", "asr"]}
+        "enabled_stages": ["vad", "asr", "speaker", "emotion"] if full else ["vad", "asr"]}
     result = {"status": "error", "error": None, "text": "", "elapsed_seconds": None}
     runner = None
     try:
@@ -56,11 +57,16 @@ async def execute(request: dict) -> dict:
         samples, warm = read_audio(Audio(**request["audio"])), read_audio(Audio(**request["warmup"]))
         save_json(directory / f"{system}-подготовка.json", preparation)
         threads = request["threads"]
-        # Настройки берутся у исходного монитора; его голоса, эмоции и LLM здесь выключены.
-        cfg = Settings(asr_threads=threads, emo_enabled=False, llm_enabled=False, split_turns=False,
-                       **request["vad_settings"])
-        runner = GigaTrtPipeline(cfg, threads, request["timeout"], Path(request["model_dir"]))
-        log.info("%s: загрузка клиента, декодера и поиска речи — вне замеров; GPU: %s", system, preparation["gpu"])
+        # Настройки берутся у исходного монитора. LLM выключена всегда; голоса и эмоции — только в полном flow.
+        if full:
+            cfg = Settings(asr_threads=threads, emo_enabled=True, llm_enabled=False, split_turns=True,
+                           **request["vad_settings"])
+            runner = GigaTrtFullPipeline(cfg, threads, request["timeout"], Path(request["model_dir"]))
+        else:
+            cfg = Settings(asr_threads=threads, emo_enabled=False, llm_enabled=False, split_turns=False,
+                           **request["vad_settings"])
+            runner = GigaTrtPipeline(cfg, threads, request["timeout"], Path(request["model_dir"]))
+        log.info("%s: загрузка клиента и моделей — вне замеров; GPU: %s", system, preparation["gpu"])
         started = time.perf_counter()
         await asyncio.wait_for(runner.load(), request["timeout"])
         engines = runner.engines
@@ -87,6 +93,10 @@ async def execute(request: dict) -> dict:
         preparation["gpu_after_measurement"] = gpu_snapshot()
         log.info("%s: статус %s; обработка %.3f с; распознавание %.3f с; запросов Triton %d; части %s", system,
                  result["status"], result["elapsed_seconds"], result["asr_seconds"], result["triton_requests"], result["trt_stages"])
+        if full:
+            log.info("%s: голоса %.3f с, вызовов %d; эмоции %.3f с, вызовов %d; собеседников %d", system,
+                     result["stages"]["speaker"]["seconds"], result["stages"]["speaker"]["calls"],
+                     result["stages"]["emotion"]["seconds"], result["stages"]["emotion"]["calls"], result.get("speakers", 0))
         for utterance in result["utterances"]:
             log.info("%s — реплика %.2f–%.2f с: %s", system, utterance["start"], utterance["end"], utterance["text"])
         if result["status"] not in {"ok", "no_speech"}:

@@ -20,6 +20,9 @@ from benchmark.tone_trt_prepare import TRT_IMAGE, TRTEX, gpu_snapshot, sha256, t
 log = logging.getLogger("подготовка-gigaam-trt")
 GIGAAM_REF = "7447938d791c4f3e643386ee22c33777004293a5"
 SYSTEM, LABEL = "gigaam_trt", "GigaAM TensorRT"
+# Полный flow без языковой модели: то же распознавание, плюс голоса собеседников и эмоции.
+FULL_SYSTEM, FULL_LABEL = "gigaam_trt_full", "GigaAM TensorRT с голосами и эмоциями"
+EMOTION_MODEL = "emo"
 MODEL, MODEL_NAME = "gigaam_encoder", "v3_e2e_rnnt"
 FEATURES, HIDDEN = 64, 768
 # Границы профиля движка в кадрах признаков (10 мс): 0,16 с … 32 с.
@@ -33,6 +36,13 @@ def vad_provider() -> str:
     if name not in VAD_PROVIDERS:
         raise ValueError("BENCH_VAD_PROVIDER должен быть cpu или cuda")
     return name
+
+
+def speaker_provider() -> str:
+    name = os.environ.get("BENCH_SPEAKER_PROVIDER", "cpu").strip().lower()
+    if name not in VAD_PROVIDERS:
+        raise ValueError("BENCH_SPEAKER_PROVIDER должен быть cpu или cuda")
+    return name
 PARTS = ("encoder.onnx", "decoder.onnx", "joint.onnx", "preprocessor.pt", "tokenizer.model")
 
 
@@ -40,7 +50,7 @@ def artifact_names() -> list[str]:
     return [f"{MODEL_NAME}.yaml", *(f"{MODEL_NAME}_{part}" for part in PARTS)]
 
 
-def export(cache: Path, weights: Path) -> None:
+def export(cache: Path, weights: Path, emotions: bool = False) -> None:
     """ONNX-части модели и состояние её экстрактора признаков. CPU, без аудио."""
     import importlib.metadata
 
@@ -68,8 +78,14 @@ def export(cache: Path, weights: Path) -> None:
         # Окно и мел-фильтры лежат в весах и отличаются от создаваемых заново: без них текст другой.
         torch.save(model.preprocessor.state_dict(), folder / f"{MODEL_NAME}_preprocessor.pt")
         shutil.copyfile(tokenizer, folder / f"{MODEL_NAME}_tokenizer.model")
+    emotion = None
+    if emotions:
+        # Клиенту веса подключены только на чтение и без сети: скачивание и проверка суммы — здесь.
+        log.info("Веса эмоций %s: проверка, при отсутствии — скачивание", EMOTION_MODEL)
+        gigaam.load_model(EMOTION_MODEL, fp16_encoder=False, use_flash=False, device="cpu", download_root=str(weights))
+        emotion = {"model": EMOTION_MODEL, "checkpoint_sha256": sha256(weights / f"{EMOTION_MODEL}.ckpt")}
     save_json(manifest_path, {
-        "model": MODEL_NAME, "source": source, "reused": reused,
+        "model": MODEL_NAME, "source": source, "reused": reused, "emotion": emotion,
         "blank_id": model.decoding.blank_id, "max_symbols": model.decoding.max_symbols,
         "pred_hidden": model.cfg.head.decoder.pred_hidden, "pred_rnn_layers": model.cfg.head.decoder.pred_rnn_layers,
         "exported_at": datetime.now().astimezone().isoformat(), "preparation_seconds": time.perf_counter() - started,
@@ -156,13 +172,14 @@ def main() -> None:
     cli.add_argument("--workspace-mib", type=int, default=4096)
     cli.add_argument("--timeout", type=int, default=3600)
     cli.add_argument("--instances", type=int, default=1, help="Копий модели в Triton")
+    cli.add_argument("--emotions", action="store_true", help="Подготовить и веса эмоций — для полного flow")
     args = cli.parse_args()
     if not 512 <= args.workspace_mib <= 8192 or args.timeout <= 0 or not 1 <= args.instances <= 16:
         cli.error("Workspace 512–8192 МиБ; время сборки положительное; копий модели от 1 до 16")
     args.out.mkdir(parents=True, exist_ok=True)
     setup_logging(args.out)
     if args.phase == "export":
-        export(args.cache, args.weights)
+        export(args.cache, args.weights, args.emotions)
     else:
         compile_engine(args.cache, args.out, args.workspace_mib, args.timeout, args.instances)
 

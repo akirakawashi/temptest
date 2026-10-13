@@ -8,6 +8,7 @@ from pathlib import Path
 import statistics
 
 LABELS = {"whisper": "Whisper", "gigaam_trt": "GigaAM TensorRT",
+          "gigaam_trt_full": "GigaAM TensorRT с голосами и эмоциями",
           "tone_trt_greedy": "T-one TensorRT без KenLM", "tone_trt_kenlm": "T-one TensorRT с KenLM"}
 NOTES = {
     "whisper_only": [
@@ -38,13 +39,28 @@ NOTES = {
         "За 15 минут — расчёт по среднему времени успешных записей; GPU общая, её нагрузка сохранена в логи/gpu.csv.",
         "Паузы — оценка детектора речи. Правильность слов требует сверки с аудио.",
     ],
+    "gigaam_tensorrt_full": [
+        "GigaAM v3_e2e_rnnt: энкодер TensorRT на GPU; звуковые признаки и жадный декодер на CPU. {streams}, без батчей.",
+        "Поиск речи Silero VAD на {vad_device} режет запись на фрагменты; каждый фрагмент — один запрос к энкодеру.",
+        "Голоса собеседников — CAM++ на {speaker_device}: окна по 1,5 с внутри фрагмента ищут смену говорящего, затем вектор каждой реплики.",
+        "Эмоции — GigaAM-Emo, PyTorch на GPU: первые 12 с каждой реплики от 0,5 с; идут одновременно с распознаванием.",
+        "Время обработки включает поиск речи, распознавание, голоса и эмоции. Языковая модель не запускается.",
+        "Экспорт модели, сборка TensorRT, запуск сервера, загрузка клиента и моделей, прогрев и отчёт исключены.",
+        "ASR, с — сумма вызовов распознавания. Этапы идут одновременно, их суммы могут пересекаться.",
+        "За 15 минут — расчёт по среднему времени успешных записей; GPU общая, её нагрузка сохранена в логи/gpu.csv.",
+        "Паузы — оценка детектора речи. Правильность слов, собеседников и эмоций требует сверки с аудио.",
+    ],
 }
+# Этапы, которые замеряет таймер flow: ключ результата и заголовок CSV.
+STAGES = {"vad": "VAD", "asr": "ASR"}
+FULL_STAGES = {**STAGES, "speaker": "Голоса", "emotion": "Эмоции"}
 # Части распознавания, которые клиент TensorRT замеряет отдельно: ключ результата и заголовок CSV.
 TRT_PARTS = {
     "tone_tensorrt": (("conversion", "Пересчёт частоты"), ("acoustic", "Акустика и gRPC"),
                       ("splitter", "Границы фраз"), ("decoder", "Декодер")),
     "gigaam_tensorrt": (("features", "Признаки"), ("encoder", "Энкодер и gRPC"), ("decoder", "Декодер")),
 }
+TRT_PARTS["gigaam_tensorrt_full"] = TRT_PARTS["gigaam_tensorrt"]
 
 
 def distribution(values: list[float]) -> dict:
@@ -64,13 +80,15 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
     systems = conditions.get("planned_systems") or ["whisper"]
     corpus = [{"source": r["audio"].source, "samples": r["audio"].samples, "sha256_pcm": r["audio"].sha256_pcm} for r in rows]
     vad_device = "CPU" if conditions.get("vad_provider") == "cpu" else "GPU"
+    speaker_device = "CPU" if conditions.get("speaker_provider") == "cpu" else "GPU"
+    stages = FULL_STAGES if mode == "gigaam_tensorrt_full" else STAGES
     parallel = int(conditions.get("protocol", {}).get("concurrency", 1))
     streams = "Звонки последовательно" if parallel == 1 else f"Одновременно обрабатывается записей: {parallel}"
     summary = {"schema_version": 3, "state": conditions["state"], "records": len(rows),
         "audio_seconds": sum(r["audio"].seconds for r in rows),
         "corpus_sha256": hashlib.sha256(json.dumps(corpus, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
         "systems": {}, "matched_comparison": {},
-        "notes": [note.format(vad_device=vad_device, streams=streams) for note in NOTES[mode]]}
+        "notes": [note.format(vad_device=vad_device, speaker_device=speaker_device, streams=streams) for note in NOTES[mode]]}
     if parallel > 1:
         summary["notes"].append("Время обработки записи измерено при работающих соседних потоках. Общая скорость всех потоков — в поле wall; "
                                 "в неё входят запуск клиента и прогрев перед каждой записью.")
@@ -96,7 +114,7 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
                 "Рабочий процесс целиком, с": preparation.get("worker_wall_seconds"),
                 "Начало замера": preparation.get("measurement_started_at", result.get("request_started_at")),
                 "Конец замера": preparation.get("measurement_finished_at", result.get("request_finished_at")), "Ошибка": result.get("error")}
-            for key, title in (("vad", "VAD"), ("asr", "ASR")):
+            for key, title in stages.items():
                 values = result.get("stages", {}).get(key, {})
                 for field, label in (("seconds", "с"), ("calls", "вызовов"), ("errors", "ошибок")):
                     item[f"{title}, {label}"] = values.get(field)
@@ -106,8 +124,10 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
                     item[f"{title}, с"] = result.get("trt_stages", {}).get(key, {}).get("seconds")
                 inside = "акустики" if mode == "tone_tensorrt" else "энкодера"
                 item[f"Вычисление {inside} внутри Triton, с"] = result.get("triton_statistics_delta", {}).get("compute_infer", {}).get("seconds")
-            if mode == "gigaam_tensorrt":
+            if mode in ("gigaam_tensorrt", "gigaam_tensorrt_full"):
                 item["Паузы, с"] = result.get("pause_seconds")
+            if mode == "gigaam_tensorrt_full":
+                item["Собеседников"] = result.get("speakers")
             csv_rows.append(item)
         entry = {"label": LABELS[system], "statuses": counts,
                  "processing_seconds": distribution([r[system]["elapsed_seconds"] for r in good]),
@@ -117,9 +137,9 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
                  "stages": {}}
         mean = entry["processing_seconds"].get("mean")
         entry["records_per_15_minutes"] = 900 / mean if mean and mean > 0 else None
-        for stage in ("vad", "asr"):
+        for stage in stages:
             # T-one обрабатывает запись целиком: внешнего поиска речи у него нет.
-            enabled = stage == "asr" or mode != "tone_tensorrt"
+            enabled = stage != "vad" or mode != "tone_tensorrt"
             stage_rows = [r[system] for r in good if enabled and stage in r[system].get("stages", {})]
             values = [result["stages"][stage]["seconds"] for result in stage_rows]
             all_stage_rows = [r.get(system, {}) for r in rows if enabled and stage in r.get(system, {}).get("stages", {})]

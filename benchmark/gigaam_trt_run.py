@@ -1,4 +1,4 @@
-"""Отдельный прогон GigaAM TensorRT: поиск речи, распознавание и паузы. Без управления продом."""
+"""Отдельный прогон GigaAM TensorRT: поиск речи, распознавание и паузы; с --full — ещё голоса и эмоции. Без управления продом."""
 from __future__ import annotations
 
 import asyncio
@@ -17,20 +17,24 @@ import time
 
 from benchmark.audio_check import decoder_info
 from benchmark.compare import Audio, host_info, setup_logging
-from benchmark.gigaam_trt_prepare import LABEL, MAX_FRAMES, MIN_FRAMES, MODEL, SYSTEM, TRT_STAGES, vad_provider
-from benchmark.summary import write_summary
+from benchmark.gigaam_trt_prepare import (FULL_SYSTEM, MAX_FRAMES, MIN_FRAMES, MODEL, SYSTEM, TRT_STAGES, speaker_provider,
+                                          vad_provider)
+from benchmark.summary import LABELS, write_summary
 from benchmark.trt_common import (REPORT_INTERVAL, VAD_SETTINGS, loop_statistics, parser, prepare, process_rows, run_worker,
                                    save_json, summary_row, triton_statistics)
 from benchmark.tone_trt_prepare import gpu_snapshot
 
 log = logging.getLogger("прогон-gigaam-trt")
-WALL = {"vad": "Поиск речи", "asr": "Распознавание", "parallel": "Одновременно", "other": "Остальная обработка"}
+WALL = {"vad": "Поиск речи", "asr": "Распознавание", "speaker": "Голоса собеседников", "emotion": "Эмоции",
+        "parallel": "Одновременно", "other": "Остальная обработка"}
 
 
 def update(output: Path, rows: list[dict], conditions: dict) -> None:
     save_json(output / "условия.json", conditions)
     summary = write_summary(output, rows, conditions)
-    stats = summary["systems"][SYSTEM]
+    system = conditions["planned_systems"][0]
+    label, full = LABELS[system], system == FULL_SYSTEM
+    stats = summary["systems"][system]
     escape = html.escape
     mean = stats["processing_seconds"].get("mean")
     processed = sum(stats["statuses"][key] for key in ("ok", "no_speech"))
@@ -40,12 +44,15 @@ def update(output: Path, rows: list[dict], conditions: dict) -> None:
     flow = (f"Потоков: {wall['parallel']}. По часам, вместе с запуском клиента и прогревом перед каждой записью: около "
             f"{int(wall['records_per_15_minutes'])} записей за 15 минут, в {wall['faster_than_realtime']:.0f} раз быстрее реального времени."
             if wall else "")
-    cards = [f"<section><h2>{escape(LABEL)}</h2><p>Завершено {processed} из {len(rows)}. {caption}.</p>" + (f"<p>{escape(flow)}</p>" if flow else ""),
+    cards = [f"<section><h2>{escape(label)}</h2><p>Завершено {processed} из {len(rows)}. {caption}.</p>" + (f"<p>{escape(flow)}</p>" if flow else ""),
              "<p>Энкодер работает на GPU через TensorRT. Признаки и декодер считаются на CPU.</p>"]
+    if full:
+        device = "CPU" if conditions["speaker_provider"] == "cpu" else "GPU"
+        cards.append(f"<p>Голоса собеседников определяет CAM++ на {device}, эмоции — GigaAM-Emo на GPU. Языковая модель не запускается.</p>")
     for key, value in stats.get("mean_record_wall_percent", {}).items():
         if key in WALL:
             cards.append(f"<div class='part'><span>{escape(WALL[key])}</span><i style='width:{value:.3f}%'></i><b>{value:.1f}%</b></div>")
-    cards.append("<p>Проценты усреднены по записям. Поиск речи и распознавание идут одновременно; пересечение показано отдельно.</p></section>")
+    cards.append("<p>Проценты усреднены по записям. Этапы идут одновременно; пересечение показано отдельно.</p></section>")
     parts = stats.get("trt_stages", {})
     if parts:
         cards.append("<section><h2>Из чего складывается распознавание</h2>")
@@ -54,21 +61,21 @@ def update(output: Path, rows: list[dict], conditions: dict) -> None:
             seconds = parts[key]["seconds"].get("total", 0)
             cards.append(f"<div class='part'><span>{escape(title)}</span><i style='width:{seconds / maximum * 75:.2f}%'></i><b>{seconds:.1f} с</b></div>")
         cards.append("<p>Сумма по всем записям. Обмен данными с Triton входит во время энкодера.</p></section>")
-    successful = [row for row in rows if row.get(SYSTEM, {}).get("status") == "ok"]
-    maximum = max((row[SYSTEM]["elapsed_seconds"] for row in successful), default=1) or 1
+    successful = [row for row in rows if row.get(system, {}).get("status") == "ok"]
+    maximum = max((row[system]["elapsed_seconds"] for row in successful), default=1) or 1
     cards.append("<section><h2>Время каждой записи</h2>")
     for row in successful:
-        seconds = row[SYSTEM]["elapsed_seconds"]
+        seconds = row[system]["elapsed_seconds"]
         cards.append(f"<div class='part'><span>{escape(Path(row['directory']).name)}</span>"
                      f"<i style='width:{seconds / maximum * 75:.2f}%'></i><b>{seconds:.2f} с</b></div>")
     cards.append("</section>")
-    tables, markdown = [], ["# GigaAM TensorRT", "", conditions["state"], "", caption + ".", *([flow, ""] if flow else [""])]
+    tables, markdown = [], [f"# {label}", "", conditions["state"], "", caption + ".", *([flow, ""] if flow else [""])]
     for row in rows:
-        result = row.get(SYSTEM, {})
+        result = row.get(system, {})
         seconds, recognition = result.get("elapsed_seconds"), result.get("asr_seconds")
         shown = f"{seconds:.3f}" if seconds is not None else "—"
         asr = f"{recognition:.3f}" if recognition is not None else "—"
-        name, text = Path(row["audio"].source).name, result.get("text", "")
+        name, text = Path(row["audio"].source).name, result.get("dialog") or result.get("text", "")
         tables.append(f"<tr><td>{escape(Path(row['directory']).name)}</td><td>{escape(name)}</td><td>{row['audio'].seconds:.2f}</td>"
             f"<td>{shown}</td><td>{asr}</td><td>{escape(result.get('status', 'pending'))}</td>"
             f"<td><details><summary>Текст</summary><pre>{escape(text)}</pre></details></td></tr>")
@@ -76,8 +83,8 @@ def update(output: Path, rows: list[dict], conditions: dict) -> None:
     notes = "".join(f"<p>{escape(note)}</p>" for note in summary["notes"])
     document = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
-<title>GigaAM TensorRT — результаты</title><style>body{background:#0b1018;color:#dbe9f6;font:16px/1.6 system-ui;max-width:1400px;margin:auto;padding:24px}section{background:#14202c;border:1px solid #304353;padding:20px;margin:24px 0;border-radius:12px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:10px;border-bottom:1px solid #304353}pre{white-space:pre-wrap;max-width:650px}.part{display:flex;gap:12px;align-items:center;font-size:13px}.part i{height:10px;background:#6ae0ba;min-width:0}.part span{min-width:210px}.part b{white-space:nowrap}.scroll{overflow:auto}@media(max-width:600px){body{padding:12px}.part span{min-width:120px}}</style>'''
-    document += f"<h1>GigaAM TensorRT</h1><p>{escape(conditions['state'])}</p><section><h2>Условия теста</h2>{notes}</section>"
+<title>''' + escape(label) + ''' — результаты</title><style>body{background:#0b1018;color:#dbe9f6;font:16px/1.6 system-ui;max-width:1400px;margin:auto;padding:24px}section{background:#14202c;border:1px solid #304353;padding:20px;margin:24px 0;border-radius:12px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:10px;border-bottom:1px solid #304353}pre{white-space:pre-wrap;max-width:650px}.part{display:flex;gap:12px;align-items:center;font-size:13px}.part i{height:10px;background:#6ae0ba;min-width:0}.part span{min-width:210px}.part b{white-space:nowrap}.scroll{overflow:auto}@media(max-width:600px){body{padding:12px}.part span{min-width:120px}}</style>'''
+    document += f"<h1>{escape(label)}</h1><p>{escape(conditions['state'])}</p><section><h2>Условия теста</h2>{notes}</section>"
     document += "".join(cards) + ("<section class='scroll'><h2>Все тексты и замеры</h2><table><tr><th>ID</th><th>Запись</th>"
         "<th>Аудио, с</th><th>Весь цикл, с</th><th>Распознавание, с</th><th>Статус</th><th>Текст</th></tr>" + "".join(tables) + "</table></section></html>")
     (output / "отчёт.html").write_text(document, encoding="utf-8")
@@ -86,7 +93,9 @@ def update(output: Path, rows: list[dict], conditions: dict) -> None:
 
 async def run(args) -> int:
     provider = vad_provider()
-    conditions = {"schema_version": 3, "mode": "gigaam_tensorrt", "planned_systems": [SYSTEM],
+    system = FULL_SYSTEM if args.full else SYSTEM
+    label = LABELS[system]
+    conditions = {"schema_version": 3, "mode": "gigaam_tensorrt_full" if args.full else "gigaam_tensorrt", "planned_systems": [system],
         "state": "Подготовка", "started_at": datetime.now().astimezone().isoformat(),
         "host": host_info(), "selected_gpu": os.environ.get("BENCH_GPU", "0"),
         "production_service_management": False, "production_requests": False,
@@ -108,7 +117,14 @@ async def run(args) -> int:
             "vad": f"Silero VAD, {'CPU' if provider == 'cpu' else 'GPU'}; порции по 100 мс",
             "segment_seconds": [MIN_FRAMES / 100, MAX_FRAMES / 100],
             "asr_seconds": "Сумма вызовов распознавания: признаки, энкодер с gRPC, декодер",
-            "disabled_stages": ["speaker", "emotion", "llm"], "artifacts_path": str(args.model_dir)}}
+            "disabled_stages": ["llm"] if args.full else ["speaker", "emotion", "llm"], "artifacts_path": str(args.model_dir)}}
+    if args.full:
+        conditions["speaker_provider"] = speaker_provider()
+        conditions["protocol"].update(
+            speaker=f"CAM++ (sherpa-onnx), {'CPU' if conditions['speaker_provider'] == 'cpu' else 'GPU'}: окна 1,5 с с шагом 0,5 с "
+                    "во фрагментах от 3,2 с и вектор каждой реплики",
+            emotion="GigaAM-Emo, PyTorch GPU:0, fp16: первые 12 с реплики длиной от 0,5 с",
+            live_speaker_hint="Отключена: подсказка для живого микрофона, на реплики не влияет")
     rows, code, started = [], 1, time.perf_counter()
     try:
         save_json(args.out / "условия.json", conditions)
@@ -118,38 +134,41 @@ async def run(args) -> int:
         if conditions["движок.json"]["fingerprint"]["gpu"]["uuid"] != conditions["gpu"]["uuid"]:
             raise RuntimeError("Движок собран на другой GPU; нужна новая подготовка")
         rows = prepare(args, conditions)
-        conditions["state"] = LABEL + " выполняется"
+        conditions["state"] = label + " выполняется"
         update(args.out, rows, conditions)
         reported = time.monotonic()
 
         async def handle(index: int, row: dict) -> None:
             nonlocal reported
-            log.info("%s %d/%d: %s", LABEL, index, len(rows), row["audio"].source)
-            payload = await run_worker({"system": SYSTEM, "threads": args.threads, "timeout": args.timeout,
+            log.info("%s %d/%d: %s", label, index, len(rows), row["audio"].source)
+            payload = await run_worker({"system": system, "threads": args.threads, "timeout": args.timeout,
                 "model_dir": str(args.model_dir), "vad_settings": conditions["vad_settings"], "parallel": args.parallel,
                 "audio": asdict(row["audio"]), "warmup": conditions["warmup"]["audio"],
                 "output": str(args.out / row["directory"]), "log_dir": str(args.out), "protocol": conditions["protocol"]})
             result = payload["result"]
             conditions["preparations"].append({"directory": row["directory"], **payload["preparation"]})
-            save_json(args.out / row["directory"] / f"{SYSTEM}.json", result)
-            (args.out / row["directory"] / f"{SYSTEM}.txt").write_text(result.get("text", "") + "\n", encoding="utf-8")
-            row[SYSTEM] = summary_row(result)
+            save_json(args.out / row["directory"] / f"{system}.json", result)
+            (args.out / row["directory"] / f"{system}.txt").write_text(result.get("text", "") + "\n", encoding="utf-8")
+            if args.full:
+                # Тот же текст с собеседниками и эмоциями — в том виде, в каком монитор отдаёт разговор на разбор.
+                (args.out / row["directory"] / f"{system}-диалог.txt").write_text(result.get("dialog", "") + "\n", encoding="utf-8")
+            row[system] = summary_row(result)
             if time.monotonic() - reported >= REPORT_INTERVAL:
                 update(args.out, rows, conditions)
                 reported = time.monotonic()
-            if row[SYSTEM].get("preparation_failed") or "резерв" in str(row[SYSTEM].get("error")).lower():
-                raise RuntimeError(row[SYSTEM]["error"])
+            if row[system].get("preparation_failed") or "резерв" in str(row[system].get("error")).lower():
+                raise RuntimeError(row[system]["error"])
 
         before, loop_started = triton_statistics(MODEL), time.perf_counter()
         try:
             await process_rows(rows, args.parallel, handle)
         finally:
-            conditions["loops"] = {SYSTEM: loop_statistics(args.parallel, time.perf_counter() - loop_started, before, triton_statistics(MODEL))}
-        code = int(any(row[SYSTEM]["status"] not in {"ok", "no_speech"} for row in rows))
+            conditions["loops"] = {system: loop_statistics(args.parallel, time.perf_counter() - loop_started, before, triton_statistics(MODEL))}
+        code = int(any(row[system]["status"] not in {"ok", "no_speech"} for row in rows))
         conditions["state"] = "Завершён с ошибками" if code else "Завершён"
     except (Exception, asyncio.CancelledError) as exc:
         conditions["state"] = "Остановлен: " + (str(exc) or "прерывание")
-        log.exception("Прогон GigaAM TensorRT остановлен")
+        log.exception("Прогон %s остановлен", label)
     finally:
         conditions.update(finished_at=datetime.now().astimezone().isoformat(),
             wall_seconds_including_preparation_and_pauses=time.perf_counter() - started)
@@ -166,12 +185,13 @@ def finalize(output: Path, exit_code: int) -> None:
         conditions["launcher_exit_code"] = exit_code
         if exit_code and not conditions["state"].startswith("Остановлен") and conditions["state"] != "Завершён с ошибками":
             conditions["state"] = "Остановлен запуском стенда; причина в логи/запуск.log"
+        system = conditions["planned_systems"][0]
         rows = []
         for record in conditions["records"]:
             row = {**record, "audio": Audio(**record["audio"])}
-            path = output / row["directory"] / f"{SYSTEM}.json"
+            path = output / row["directory"] / f"{system}.json"
             if path.is_file():
-                row[SYSTEM] = summary_row(json.loads(path.read_text(encoding="utf-8")))
+                row[system] = summary_row(json.loads(path.read_text(encoding="utf-8")))
             rows.append(row)
         update(output, rows, conditions)
     shutil.rmtree(output / "временные", ignore_errors=True)
@@ -184,12 +204,18 @@ def finalize(output: Path, exit_code: int) -> None:
     print(f"Архив: {output / 'диагностика.tar.gz'}; без аудио и моделей, с текстами разговоров", flush=True)
 
 
+def arguments():
+    cli = parser()
+    cli.description = __doc__
+    cli.add_argument("--full", action="store_true", help="Полный flow без LLM: добавить голоса собеседников и эмоции")
+    return cli
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--finalize":
         finalize(Path(sys.argv[2]), int(sys.argv[3]))
         return 0
-    cli = parser()
-    cli.description = __doc__
+    cli = arguments()
     args = cli.parse_args()
     if min(args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0 or not 1 <= args.parallel <= 32:
         cli.error("Число потоков и времена положительные; одновременно от 1 до 32 записей")

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Только отдельный GigaAM TensorRT: поиск речи, распознавание, паузы. Ни одной команды управления продом.
+# Только отдельный GigaAM TensorRT: поиск речи, распознавание, паузы; с --full — ещё голоса и эмоции. Ни одной команды управления продом.
 set -euo pipefail
 exec </dev/null
 if [[ $# -lt 1 || ! -d "$1" ]]; then
-    echo 'Использование: bash benchmark/run-gigaam-trt.sh /папка/аудио [--reference-run /старый/прогон]' >&2
+    echo 'Использование: bash benchmark/run-gigaam-trt.sh /папка/аудио [--full] [--parallel N] [--reference-run /старый/прогон]' >&2
     exit 2
 fi
 TRT_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -11,7 +11,7 @@ export BENCH_AUDIO_DIR="$(cd -- "$1" && pwd -P)"
 shift
 TRT_ARGS=() TRT_REFERENCE_ARGS=()
 TRT_REFERENCE=''
-TRT_PARALLEL=1
+TRT_PARALLEL=1 TRT_FULL=0
 TRT_IMAGE='nvcr.io/nvidia/tritonserver:25.06-py3'
 while (( $# )); do
     case "$1" in
@@ -29,6 +29,7 @@ while (( $# )); do
                 echo '--parallel требует число одновременных записей от 1 до 32' >&2; exit 2;
             }
             TRT_PARALLEL=$((10#$2)); shift 2 ;;
+        --full) TRT_FULL=1; shift ;;
         --gap|--gap=*|--expected-files|--expected-files=*)
             echo "$1 больше нет: обрабатываются все записи папки, пауз между ними нет" >&2; exit 2 ;;
         *) TRT_ARGS+=("$1"); shift ;;
@@ -39,12 +40,21 @@ flock -n 9 || { echo 'Другой тест стенда уже выполняе
 export BENCH_OUT="${BENCH_OUT:-$TRT_PROJECT_DIR/benchmark-results}"
 export BENCH_CACHE="${BENCH_CACHE:-$TRT_PROJECT_DIR/benchmark-cache}"
 export BENCH_GPU="${BENCH_GPU:-0}" BENCH_THREADS="${BENCH_THREADS:-4}"
+# В полном flow у каждого обработчика своя модель эмоций на GPU. Замер на RTX 4070 SUPER: 2,7 ГиБ памяти
+# и 0,9 ГиБ видеопамяти на обработчик; значения ниже взяты с запасом для общей карты.
+TRT_STREAM_MEMORY=2 TRT_NEED_FREE=0
+TRT_EMOTION_VRAM="${BENCH_EMOTION_VRAM_MIB:-1536}"
+[[ "$TRT_EMOTION_VRAM" =~ ^[0-9]+$ ]] || { echo 'BENCH_EMOTION_VRAM_MIB должен быть целым числом' >&2; exit 2; }
+(( ! TRT_FULL )) || TRT_STREAM_MEMORY=5
+if (( TRT_PARALLEL > 1 || TRT_FULL )); then
+    TRT_MEMORY=$(( TRT_PARALLEL * TRT_STREAM_MEMORY + 2 ))
+    (( TRT_MEMORY >= 8 )) || TRT_MEMORY=8
+    export BENCH_CLIENT_MEMORY="${BENCH_CLIENT_MEMORY:-${TRT_MEMORY}g}"
+fi
 if (( TRT_PARALLEL > 1 )); then
     # Потоки делят ядра: по два на поток; сервер моделей работает на том же наборе.
-    TRT_CORES=$(( TRT_PARALLEL * 2 )) TRT_MEMORY=$(( TRT_PARALLEL * 2 + 2 ))
-    (( TRT_MEMORY >= 8 )) || TRT_MEMORY=8
+    TRT_CORES=$(( TRT_PARALLEL * 2 ))
     export BENCH_CLIENT_CPUS="${BENCH_CLIENT_CPUS:-$TRT_CORES}" BENCH_CPUSET="${BENCH_CPUSET:-0-$(( TRT_CORES - 1 ))}"
-    export BENCH_CLIENT_MEMORY="${BENCH_CLIENT_MEMORY:-${TRT_MEMORY}g}"
 fi
 export BENCH_CLIENT_CPUS="${BENCH_CLIENT_CPUS:-$BENCH_THREADS}" BENCH_CPUSET="${BENCH_CPUSET:-0-3}"
 export BENCH_CLIENT_MEMORY="${BENCH_CLIENT_MEMORY:-8g}"
@@ -55,8 +65,9 @@ export BENCH_BUILD_NETWORK="${BENCH_BUILD_NETWORK:-default}" BENCH_DOWNLOAD_NETW
 export BENCH_UID="$(id -u)" BENCH_GID="$(id -g)"
 TRT_MIN_RAM="${BENCH_MIN_RAM_MIB:-24576}" TRT_MIN_DISK="${BENCH_MIN_DISK_MIB:-32768}"
 TRT_WORKSPACE="${BENCH_TRT_WORKSPACE_MIB:-4096}" TRT_COMPILE_TIMEOUT="${BENCH_TRT_COMPILE_TIMEOUT:-3600}"
-export BENCH_VAD_PROVIDER="${BENCH_VAD_PROVIDER:-cpu}"
+export BENCH_VAD_PROVIDER="${BENCH_VAD_PROVIDER:-cpu}" BENCH_SPEAKER_PROVIDER="${BENCH_SPEAKER_PROVIDER:-cpu}"
 [[ "$BENCH_VAD_PROVIDER" == cpu || "$BENCH_VAD_PROVIDER" == cuda ]] || { echo 'BENCH_VAD_PROVIDER должен быть cpu или cuda' >&2; exit 2; }
+[[ "$BENCH_SPEAKER_PROVIDER" == cpu || "$BENCH_SPEAKER_PROVIDER" == cuda ]] || { echo 'BENCH_SPEAKER_PROVIDER должен быть cpu или cuda' >&2; exit 2; }
 for number in "$BENCH_GPU" "$BENCH_THREADS" "$BENCH_GPU_MIN_FREE_MIB" "$BENCH_GPU_MAX_UTIL" "$BENCH_GPU_RESERVE_MIB" "$TRT_MIN_RAM" "$TRT_MIN_DISK" "$TRT_WORKSPACE" "$TRT_COMPILE_TIMEOUT" "$BENCH_CLIENT_CPUS" "$BENCH_TRITON_INSTANCES"; do
     [[ "$number" =~ ^[0-9]+$ ]] || { echo 'Номер GPU, пороги и времена должны быть целыми числами' >&2; exit 2; }
 done
@@ -69,7 +80,13 @@ mkdir -p -- "$BENCH_OUT" "$BENCH_CACHE/gigaam-trt" "$BENCH_CACHE/gigaam"
 export BENCH_OUT="$(cd -- "$BENCH_OUT" && pwd -P)" BENCH_CACHE="$(cd -- "$BENCH_CACHE" && pwd -P)"
 case "$BENCH_OUT/" in "$BENCH_AUDIO_DIR/"*) echo 'Результаты должны быть вне папки аудио' >&2; exit 2 ;; esac
 case "$BENCH_CACHE/" in "$BENCH_AUDIO_DIR/"*) echo 'Кеш должен быть вне папки аудио' >&2; exit 2 ;; esac
-TRT_RUN_ID="gigaam-trt-$(TZ=Europe/Moscow date +%Y%m%d-%H%M%S)-$$"
+TRT_FULL_ARGS=() TRT_EXPORT_ARGS=() TRT_KIND=gigaam-trt
+if (( TRT_FULL )); then
+    TRT_FULL_ARGS=(--full) TRT_EXPORT_ARGS=(--emotions) TRT_KIND=gigaam-trt-full
+    # Запас сверх резерва: сервер моделей и по одной модели эмоций на поток.
+    TRT_NEED_FREE=$(( BENCH_GPU_RESERVE_MIB + 2048 + TRT_PARALLEL * TRT_EMOTION_VRAM ))
+fi
+TRT_RUN_ID="$TRT_KIND-$(TZ=Europe/Moscow date +%Y%m%d-%H%M%S)-$$"
 export BENCH_RUN_OUT="$BENCH_OUT/$TRT_RUN_ID"
 export BENCH_REFERENCE_DIR="${TRT_REFERENCE:-$TRT_PROJECT_DIR/benchmark}"
 mkdir -p "$BENCH_RUN_OUT/логи"
@@ -133,6 +150,10 @@ check_capacity() {
     echo "Ресурсы: GPU свободно $free МиБ, загрузка $util%; RAM $ram МиБ."
     [[ "$free" =~ ^[0-9]+$ && "$util" =~ ^[0-9]+$ && "$ram" =~ ^[0-9]+$ ]] || return 1
     (( free >= BENCH_GPU_MIN_FREE_MIB && util <= BENCH_GPU_MAX_UTIL && ram >= TRT_MIN_RAM )) || return 1
+    if (( free < TRT_NEED_FREE )); then
+        echo "Полному flow на $TRT_PARALLEL потоков нужно $TRT_NEED_FREE МиБ свободной видеопамяти: у каждого потока своя модель эмоций. Уменьшите --parallel."
+        return 1
+    fi
     docker_root=$(timeout 30 docker info --format '{{.DockerRootDir}}')
     for directory in "$BENCH_OUT" "$BENCH_CACHE" "$docker_root"; do
         disk=$(df -Pm "$directory" | awk 'NR==2 {print $4}')
@@ -187,7 +208,12 @@ wait_task() {
         sleep 2
     done
 }
-echo "Прогон $TRT_RUN_ID: GigaAM TensorRT — поиск речи, распознавание и паузы; голоса, эмоции и LLM не запускаются."
+if (( TRT_FULL )); then
+    echo "Прогон $TRT_RUN_ID: GigaAM TensorRT — поиск речи, распознавание, голоса собеседников и эмоции; LLM не запускается."
+    echo "Голоса: CAM++ на $BENCH_SPEAKER_PROVIDER; эмоции: GigaAM-Emo на GPU, своя модель у каждого потока, нужно свободной видеопамяти: $TRT_NEED_FREE МиБ."
+else
+    echo "Прогон $TRT_RUN_ID: GigaAM TensorRT — поиск речи, распознавание и паузы; голоса, эмоции и LLM не запускаются."
+fi
 echo "GPU $BENCH_GPU; поиск речи: $BENCH_VAD_PROVIDER; модели в $BENCH_CACHE/gigaam-trt; результаты $BENCH_RUN_OUT."
 echo "Одновременно записей: $TRT_PARALLEL; копий модели в Triton: $BENCH_TRITON_INSTANCES; ядер: $BENCH_CLIENT_CPUS (набор $BENCH_CPUSET); память клиента: $BENCH_CLIENT_MEMORY."
 echo 'Экспорт модели и сборка TensorRT — вне замеров. Обработка: внутренняя сеть, без публикации портов.'
@@ -223,7 +249,7 @@ docker image inspect speech-comparison:2.0.0-gigaam-trt-client "$TRT_IMAGE" \
     > "$BENCH_RUN_OUT/логи/образы.json"
 if ! check_capacity; then echo 'После сборки недостаточно ресурсов.'; exit 42; fi
 start_container "speech-comparison-gigaam-trt-export-$TRT_RUN_ID" export \
-    export --out /results
+    export --out /results "${TRT_EXPORT_ARGS[@]}"
 wait_task "speech-comparison-gigaam-trt-export-$TRT_RUN_ID" экспорт
 monitor_gpu 9>&- &
 TRT_MONITOR_PID=$!
@@ -249,6 +275,6 @@ while true; do
 done
 echo 'Наш Triton готов; начинаем корпус. Загрузка серверной модели исключена из замеров.'
 start_container "speech-comparison-gigaam-trt-client-$TRT_RUN_ID" client /recordings --parallel "$TRT_PARALLEL" \
-    --out /results "${TRT_REFERENCE_ARGS[@]}" "${TRT_ARGS[@]}"
+    --out /results "${TRT_FULL_ARGS[@]}" "${TRT_REFERENCE_ARGS[@]}" "${TRT_ARGS[@]}"
 wait_task "speech-comparison-gigaam-trt-client-$TRT_RUN_ID" gigaam-trt
 timeout 30 docker logs "$TRT_SERVER" > "$BENCH_RUN_OUT/логи/triton.log" 2>&1 || true

@@ -19,7 +19,7 @@ from benchmark.compare import FORMATS, prepare_audio
 log = logging.getLogger("прогон-tensorrt")
 VAD_SETTINGS = {"vad_threshold": .5, "vad_min_silence": .45, "vad_min_speech": .25, "vad_max_speech": 15.}
 WORKERS = {"tone_trt_greedy": "benchmark.tone_trt_worker", "tone_trt_kenlm": "benchmark.tone_trt_worker",
-           "gigaam_trt": "benchmark.gigaam_trt_worker"}
+           "gigaam_trt": "benchmark.gigaam_trt_worker", "gigaam_trt_full": "benchmark.gigaam_trt_worker"}
 # Подробности записи лежат в её файле; сводке и отчёту они не нужны, а на тысячах записей занимают гигабайты памяти.
 HEAVY = ("stage_calls", "speech_segments", "events", "utterances", "raw_phrases", "pauses", "counters")
 # Отчёт переписывается целиком, поэтому не после каждой записи: на тысячах записей это съедало бы время потоков.
