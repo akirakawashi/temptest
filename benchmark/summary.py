@@ -18,7 +18,7 @@ NOTES = {
         "Правильность слов требует сверки с аудио: скорость не определяет точность.",
     ],
     "tone_tensorrt": [
-        "Официальный T-one: акустика TensorRT на GPU; границы фраз и декодер на CPU. Звонки последовательно, batch=1.",
+        "Официальный T-one: акустика TensorRT на GPU; границы фраз и декодер на CPU. {streams}, batch=1.",
         "Весь моно WAV обрабатывается с сохранением контекста; внешний Silero VAD не режет запись.",
         "Время обработки включает пересчёт 16 → 8 кГц, обмен с Triton, акустику, splitter, декодер и финализацию фраз.",
         "Скачивание, сборка TensorRT, запуск сервера, загрузка декодера, прогрев и отчёт исключены.",
@@ -29,7 +29,7 @@ NOTES = {
         "Паузы оценены официальным splitter; они не равнозначны паузам Silero VAD.",
     ],
     "gigaam_tensorrt": [
-        "GigaAM v3_e2e_rnnt: энкодер TensorRT на GPU; звуковые признаки и жадный декодер на CPU. Звонки последовательно, без батчей.",
+        "GigaAM v3_e2e_rnnt: энкодер TensorRT на GPU; звуковые признаки и жадный декодер на CPU. {streams}, без батчей.",
         "Поиск речи Silero VAD на {vad_device} режет запись на фрагменты; каждый фрагмент — один запрос к энкодеру.",
         "Время обработки включает поиск речи, признаки, обмен с Triton, энкодер и декодер.",
         "Экспорт модели, сборка TensorRT, запуск сервера, загрузка клиента, прогрев и отчёт исключены.",
@@ -64,11 +64,16 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
     systems = conditions.get("planned_systems") or ["whisper"]
     corpus = [{"source": r["audio"].source, "samples": r["audio"].samples, "sha256_pcm": r["audio"].sha256_pcm} for r in rows]
     vad_device = "CPU" if conditions.get("vad_provider") == "cpu" else "GPU"
+    parallel = int(conditions.get("protocol", {}).get("concurrency", 1))
+    streams = "Звонки последовательно" if parallel == 1 else f"Одновременно обрабатывается записей: {parallel}"
     summary = {"schema_version": 3, "state": conditions["state"], "records": len(rows),
         "audio_seconds": sum(r["audio"].seconds for r in rows),
         "corpus_sha256": hashlib.sha256(json.dumps(corpus, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
         "systems": {}, "matched_comparison": {},
-        "notes": [note.format(vad_device=vad_device) for note in NOTES[mode]]}
+        "notes": [note.format(vad_device=vad_device, streams=streams) for note in NOTES[mode]]}
+    if parallel > 1:
+        summary["notes"].append("Время обработки записи измерено при работающих соседних потоках. Общая скорость всех потоков — в поле wall; "
+                                "в неё входят запуск клиента и прогрев перед каждой записью.")
     if conditions.get("reference"):
         summary["notes"].append("PCM и запись прогрева сверены с исходным прогоном; даты и фоновая нагрузка различаются.")
     parts = TRT_PARTS.get(mode, ())
@@ -130,6 +135,14 @@ def write_summary(output: Path, rows: list, conditions: dict) -> dict:
             total = sum(sum(t["exclusive_wall_seconds"].values()) for t in timed)
             entry["exclusive_wall_percent"] = {key: sum(t["exclusive_wall_seconds"][key] for t in timed) / total * 100 if total else 0 for key in keys}
             entry["mean_record_wall_percent"] = {key: statistics.mean(t["exclusive_wall_percent"][key] for t in timed) for key in keys}
+        loop = conditions.get("loops", {}).get(system)
+        finished = [r for r in rows if r.get(system, {}).get("status") in ("ok", "no_speech")]
+        if loop and loop["loop_seconds"] > 0 and finished:
+            # По часам: все потоки вместе, с запуском клиента и прогревом перед каждой записью.
+            audio = sum(r["audio"].seconds for r in finished)
+            entry["wall"] = {"parallel": loop["parallel"], "loop_seconds": loop["loop_seconds"], "records": len(finished),
+                "records_per_15_minutes": len(finished) / loop["loop_seconds"] * 900,
+                "faster_than_realtime": audio / loop["loop_seconds"], "triton": loop.get("triton")}
         if parts:
             entry["trt_stages"] = {key: {
                 "seconds": distribution([r[system]["trt_stages"][key]["seconds"] for r in good]),

@@ -78,7 +78,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    cpus: "${BENCH_THREADS:-4}"
+    cpus: "${BENCH_CLIENT_CPUS:-4}"
     cpuset: "${BENCH_CPUSET:-0-3}"
     mem_limit: 8g
     shm_size: 128m
@@ -110,15 +110,17 @@ services:
 
   client:
     <<: *client
-    cpus: "${BENCH_THREADS:-4}"
+    # Квота на все потоки вместе; BENCH_THREADS — потоки одного обработчика.
+    cpus: "${BENCH_CLIENT_CPUS:-4}"
     cpuset: "${BENCH_CPUSET:-0-3}"
-    mem_limit: 8g
+    mem_limit: ${BENCH_CLIENT_MEMORY:-8g}
     networks: [gigaam]
     environment:
       # utility — nvidia-smi для замеров памяти; compute нужен только поиску речи при BENCH_VAD_PROVIDER=cuda.
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       BENCH_VAD_PROVIDER: ${BENCH_VAD_PROVIDER:-cpu}
       BENCH_THREADS: ${BENCH_THREADS:-4}
+      BENCH_TRITON_INSTANCES: ${BENCH_TRITON_INSTANCES:-1}
       BENCH_GPU: ${BENCH_GPU:-0}
       BENCH_GPU_MIN_FREE_MIB: ${BENCH_GPU_MIN_FREE_MIB:-12288}
       BENCH_GPU_MAX_UTIL: ${BENCH_GPU_MAX_UTIL:-10}

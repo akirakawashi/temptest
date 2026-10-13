@@ -73,7 +73,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    cpus: "${BENCH_THREADS:-4}"
+    cpus: "${BENCH_CLIENT_CPUS:-4}"
     cpuset: "${BENCH_CPUSET:-0-3}"
     mem_limit: 8g
     shm_size: 128m
@@ -105,13 +105,15 @@ services:
 
   client:
     <<: *client
-    cpus: "${BENCH_THREADS:-4}"
+    # Квота на все потоки вместе; BENCH_THREADS — потоки одного обработчика.
+    cpus: "${BENCH_CLIENT_CPUS:-4}"
     cpuset: "${BENCH_CPUSET:-0-3}"
-    mem_limit: 16g
+    mem_limit: ${BENCH_CLIENT_MEMORY:-16g}
     networks: [tone]
     environment:
       NVIDIA_DRIVER_CAPABILITIES: utility
       BENCH_THREADS: ${BENCH_THREADS:-4}
+      BENCH_TRITON_INSTANCES: ${BENCH_TRITON_INSTANCES:-1}
       BENCH_GPU: ${BENCH_GPU:-0}
       BENCH_GPU_RESERVE_MIB: ${BENCH_GPU_RESERVE_MIB:-3072}
       OMP_NUM_THREADS: ${BENCH_THREADS:-4}

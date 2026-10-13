@@ -281,6 +281,48 @@ def test_worker_keeps_preparation_and_warmup_outside_measurement(monkeypatch, tm
     assert (tmp_path / "tone_trt_greedy-прогрев.json").is_file()
 
 
+def test_model_copies_change_only_the_server_config():
+    one, three = preparation.model_config(), preparation.model_config(3)
+    assert "count: 1 kind: KIND_GPU" in one and one.replace("count: 1 kind", "count: 3 kind") == three
+    config = configuration()
+    config["instance_group"][0]["count"] = 3
+    assert tone_trt.validate_config(config, 3)["name"] == "streaming_acoustic"
+    with pytest.raises(RuntimeError, match="копий модели: 1"):
+        tone_trt.validate_config(config)
+
+
+def test_parallel_corpus_processes_each_variant_with_several_streams(monkeypatch, tmp_path):
+    args = args_for(tmp_path)
+    for name in ("c.wav", "d.wav"):
+        (args.audio_dir / name).write_bytes((args.audio_dir / "a.wav").read_bytes())
+    args.parallel = 2
+    monkeypatch.setattr("benchmark.trt_common.prepare_audio", fake_audio)
+    monkeypatch.setattr(tone_trt_run, "gpu_snapshot", lambda: {"uuid": "GPU-1"})
+    active, peak, order = 0, 0, []
+    async def worker(request):
+        nonlocal active, peak
+        assert request["parallel"] == 2
+        order.append(request["system"])
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(.02)
+        active -= 1
+        return {"result": {"status": "ok", "text": "355 рублей", "elapsed_seconds": .4, "asr_seconds": .4, "error": None,
+            "stages": {"asr": {"seconds": .4, "calls": 1, "errors": 0}},
+            "trt_stages": {key: {"seconds": .1, "calls": 1, "errors": 0} for key in tone_trt.STAGES}},
+            "preparation": {"system": request["system"], "load_seconds": 1., "warmup_seconds": .5}}
+    monkeypatch.setattr(tone_trt_run, "run_worker", worker)
+    assert asyncio.run(tone_trt_run.run(args)) == 0
+    summary = json.loads((args.out / "итоги.json").read_text())
+    conditions = json.loads((args.out / "условия.json").read_text())
+    # Варианты идут один за другим, записи внутри варианта — по две сразу.
+    assert peak == 2 and order == ["tone_trt_greedy"] * 4 + ["tone_trt_kenlm"] * 4
+    assert set(conditions["loops"]) == {"tone_trt_greedy", "tone_trt_kenlm"} and conditions["protocol"]["concurrency"] == 2
+    for entry in summary["systems"].values():
+        assert entry["statuses"]["ok"] == 4 and entry["wall"]["parallel"] == 2 and entry["wall"]["records"] == 4
+    assert "Потоков: 2" in (args.out / "отчёт.html").read_text()
+
+
 def test_compose_keeps_audio_off_download_and_export_and_all_ports_private():
     config = yaml.safe_load((ROOT / "compose.tone-trt-benchmark.yml").read_text())
     assert config["name"] == "speech-comparison-tone-trt"
@@ -295,6 +337,10 @@ def test_compose_keeps_audio_off_download_and_export_and_all_ports_private():
     assert config["services"]["export"]["network_mode"] == "none"
     assert config["services"]["client"]["volumes"][0].endswith(":ro")
     assert config["services"]["client"]["environment"]["NVIDIA_DRIVER_CAPABILITIES"] == "utility"
+    client, triton = config["services"]["client"], config["services"]["triton"]
+    assert client["cpus"] == triton["cpus"] == "${BENCH_CLIENT_CPUS:-4}" and client["cpuset"] == triton["cpuset"]
+    assert client["mem_limit"] == "${BENCH_CLIENT_MEMORY:-16g}"
+    assert client["environment"]["BENCH_TRITON_INSTANCES"] == "${BENCH_TRITON_INSTANCES:-1}"
 
 
 def test_source_bundle_holds_every_launcher_and_nothing_of_removed_modes():

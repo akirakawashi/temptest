@@ -45,6 +45,19 @@ def test_cpu_wrong_gpu_batches_and_wrong_model_are_rejected(change):
         gigaam_trt.validate_config(config)
 
 
+def test_model_copies_change_only_the_server_config():
+    one, three = preparation.model_config(), preparation.model_config(3)
+    assert "count: 1 kind: KIND_GPU" in one and "count: 3 kind: KIND_GPU" in three
+    assert one.replace("count: 1", "count: 3") == three and preparation.model_config(1) == one
+    config = configuration()
+    config["config"]["instance_group"][0]["count"] = 3
+    assert gigaam_trt.validate_config(config, 3)["name"] == "gigaam_encoder"
+    with pytest.raises(RuntimeError, match="копий модели: 1"):
+        gigaam_trt.validate_config(config)
+    with pytest.raises(RuntimeError, match="копий модели: 3"):
+        gigaam_trt.validate_config(configuration(), 3)
+
+
 def test_generated_triton_config_matches_validated_shapes():
     text = preparation.model_config()
     assert 'platform: "tensorrt_plan"' in text and "max_batch_size: 0" in text
@@ -368,6 +381,72 @@ def test_corpus_keeps_results_reports_and_pending_files(monkeypatch, tmp_path, f
         assert not any(n.endswith((".wav", ".onnx", ".plan", ".ckpt")) for n in names)
 
 
+def test_parallel_corpus_runs_several_records_at_once_and_reports_wall_speed(monkeypatch, tmp_path):
+    args = args_for(tmp_path)
+    for name in ("c.wav", "d.wav", "e.wav", "f.wav"):
+        (args.audio_dir / name).write_bytes((args.audio_dir / "a.wav").read_bytes())
+    args.parallel = 3
+    monkeypatch.setattr("benchmark.trt_common.prepare_audio", fake_audio)
+    monkeypatch.setattr(gigaam_trt_run, "gpu_snapshot", lambda: {"uuid": "GPU-1"})
+    counters = iter([{"success": {"calls": 0, "seconds": 0.}, "queue": {"calls": 0, "seconds": 0.}},
+                     {"success": {"calls": 6, "seconds": 3.}, "queue": {"calls": 6, "seconds": 1.5}}])
+    monkeypatch.setattr(gigaam_trt_run, "triton_statistics", lambda model: next(counters))
+    active, peak = 0, 0
+    async def worker(request):
+        nonlocal active, peak
+        assert request["parallel"] == 3
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(.02)
+        active -= 1
+        stages = {key: {"seconds": .2, "calls": 1, "errors": 0} for key in pipeline.STAGES}
+        return {"result": {"status": "ok", "text": "Добрый день.", "elapsed_seconds": .4, "asr_seconds": .2, "error": None,
+            "stages": stages, "pause_seconds": .5, "triton_requests": 1, "triton_statistics_delta": {"available": False},
+            "trt_stages": {key: {"seconds": .05, "calls": 1, "errors": 0} for key in preparation.TRT_STAGES}},
+            "preparation": {"system": request["system"], "load_seconds": 1., "warmup_seconds": .5}}
+    monkeypatch.setattr(gigaam_trt_run, "run_worker", worker)
+    assert asyncio.run(gigaam_trt_run.run(args)) == 0
+    conditions = json.loads((args.out / "условия.json").read_text())
+    summary = json.loads((args.out / "итоги.json").read_text())
+    wall = summary["systems"]["gigaam_trt"]["wall"]
+    assert peak == 3 and conditions["protocol"]["concurrency"] == 3 and conditions["state"] == "Завершён"
+    assert wall["parallel"] == 3 and wall["records"] == 6 and wall["triton"]["queue"] == {"calls": 6, "seconds": 1.5}
+    assert wall["records_per_15_minutes"] == pytest.approx(6 / wall["loop_seconds"] * 900)
+    assert wall["faster_than_realtime"] == pytest.approx(6 / wall["loop_seconds"])
+    assert any("Одновременно обрабатывается записей: 3" in note for note in summary["notes"])
+    assert "Потоков: 3" in (args.out / "отчёт.html").read_text() and "Потоков: 3" in (args.out / "отчёт.md").read_text()
+    assert len(list(args.out.glob("записи/*/gigaam_trt.json"))) == 6
+
+
+def test_parallel_worker_does_not_compare_shared_server_counters(monkeypatch, tmp_path):
+    """При нескольких потоках в счётчики сервера попадают чужие запросы: сверка с клиентом была бы ложной тревогой."""
+    def stats(count):
+        return {"model_stats": [{"name": "gigaam_encoder", "version": "1", "inference_stats": {
+            key: {"count": count, "ns": count * 1000} for key in ("success", "fail", "queue", "compute_input", "compute_infer", "compute_output")}}]}
+    class Pipeline:
+        def __init__(self, cfg, threads, timeout, cache):
+            self.engines = SimpleNamespace(versions={}, server_metadata={}, model_metadata={}, config={},
+                engine_metadata={"engine_sha256": "verified"}, placement=lambda: {})
+            self.snapshots = iter([stats(10), stats(90)])
+        async def load(self): pass
+        async def run(self, samples):
+            return {"status": "ok", "elapsed_seconds": .5, "asr_seconds": .2, "text": "Добрый день.",
+                    "triton_requests": 2, "trt_stages": {}, "utterances": []}
+        def statistics(self): return next(self.snapshots)
+        def close(self): pass
+    monkeypatch.setattr(gigaam_trt, "GigaTrtPipeline", Pipeline)
+    monkeypatch.setattr(gigaam_trt_worker, "gpu_snapshot", lambda: {"free_mib": 10000})
+    monkeypatch.setattr(gigaam_trt_worker, "read_audio", lambda x: np.zeros(16000, dtype=np.float32))
+    audio = asdict(Audio("input", "prepared", 1., 16000, "sha", .01))
+    request = {"system": "gigaam_trt", "output": str(tmp_path), "threads": 1, "model_dir": "/cache", "timeout": 3,
+        "audio": audio, "warmup": audio, "protocol": {},
+        "vad_settings": {"vad_threshold": .5, "vad_min_silence": .45, "vad_min_speech": .25, "vad_max_speech": 15.}}
+    alone = asyncio.run(gigaam_trt_worker.execute(dict(request)))
+    assert alone["result"]["status"] == "error" and "отличается от клиента" in alone["result"]["error"]
+    together = asyncio.run(gigaam_trt_worker.execute({**request, "parallel": 5}))
+    assert together["result"]["status"] == "ok" and together["result"]["triton_statistics_delta"]["available"] is False
+
+
 def test_worker_keeps_load_and_warmup_outside_measurement(monkeypatch, tmp_path):
     calls = []
     class Pipeline:
@@ -421,6 +500,10 @@ def test_compose_keeps_audio_off_preparation_and_all_ports_private():
     assert config["services"]["compile"]["network_mode"] == "none"
     assert config["services"]["client"]["volumes"][0].endswith(":ro")
     assert config["services"]["client"]["environment"]["BENCH_VAD_PROVIDER"] == "${BENCH_VAD_PROVIDER:-cpu}"
+    client, triton = config["services"]["client"], config["services"]["triton"]
+    assert client["cpus"] == triton["cpus"] == "${BENCH_CLIENT_CPUS:-4}" and client["cpuset"] == triton["cpuset"]
+    assert client["mem_limit"] == "${BENCH_CLIENT_MEMORY:-8g}"
+    assert client["environment"]["BENCH_TRITON_INSTANCES"] == "${BENCH_TRITON_INSTANCES:-1}"
     assert not any("ollama" in json.dumps(service).lower() for service in config["services"].values())
 
 
@@ -510,7 +593,66 @@ if args[0]=='logs': print('Журнал нашего контейнера',flush
     assert all("--pull" in cmd and cmd[cmd.index("--pull") + 1] == "never" for cmd in runs)
     client = runs[-1]
     assert client[-4:] == ["--out", "/results", "--max-audio-seconds", "7200"] and "/recordings" in client
-    assert "поиск речи: cpu" in launched.stdout
+    assert client[client.index("--parallel") + 1] == "1" and runs[1][runs[1].index("--instances") + 1] == "1"
+    assert "поиск речи: cpu" in launched.stdout and "Одновременно записей: 1; копий модели в Triton: 1; ядер: 4 (набор 0-3)" in launched.stdout
+
+
+def fake_launch(tmp_path, script, *arguments, **extra):
+    """Запуск скрипта стенда с подменным docker: команды только записываются."""
+    binary, audio = tmp_path / "bin", tmp_path / "audio"
+    binary.mkdir(); audio.mkdir()
+    commands = tmp_path / "commands.jsonl"
+    code = f'''#!{sys.executable}
+import fcntl,hashlib,json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with open(os.environ['FAKE_COMMANDS'],'a') as f:
+    fcntl.flock(f,fcntl.LOCK_EX); f.write(json.dumps([Path(sys.argv[0]).name,*args])+'\\n')
+if Path(sys.argv[0]).name=='nvidia-smi':
+    print('18000, 100' if any('memory.free,utilization' in a for a in args) else '2026/10/13 12:00:00, GPU-test, 100, 2000, 18000, 95830, 100, 45'); sys.exit(0)
+if args[:2]==['image','inspect']: print('[]'); sys.exit(0)
+if args[0]=='info': print(os.environ['FAKE_ROOT'])
+elif args[0]=='compose' and 'run' in args: print(hashlib.sha256(args[args.index('--name')+1].encode()).hexdigest())
+elif args[0]=='inspect':
+    fmt=args[args.index('--format')+1] if '--format' in args else ''
+    print(hashlib.sha256(args[-1].encode()).hexdigest() if fmt=='{{{{.Id}}}}' else 'true healthy' if '.State.Health' in fmt else 'false 0')
+'''
+    for name in ("docker", "nvidia-smi"):
+        executable = binary / name
+        executable.write_text(code)
+        executable.chmod(0o755)
+    env = {**os.environ, "PATH": str(binary) + ":" + os.environ["PATH"], "FAKE_COMMANDS": str(commands), "FAKE_ROOT": str(tmp_path),
+        "BENCH_OUT": str(tmp_path / "results"), "BENCH_CACHE": str(tmp_path / "cache"),
+        "BENCH_GPU_MAX_UTIL": "100", "BENCH_MIN_RAM_MIB": "0", "BENCH_MIN_DISK_MIB": "0", **extra}
+    for name in ("BENCH_VAD_PROVIDER", "BENCH_GPU_MIN_FREE_MIB", "BENCH_CLIENT_CPUS", "BENCH_CPUSET", "BENCH_CLIENT_MEMORY", "BENCH_TRITON_INSTANCES"):
+        if name not in extra:
+            env.pop(name, None)
+    launched = subprocess.run(["bash", str(ROOT / "benchmark" / script), str(audio), *arguments], env=env, capture_output=True, text=True, timeout=30)
+    journal = [json.loads(line)[1:] for line in commands.read_text().splitlines() if json.loads(line)[0] == "docker"] if commands.exists() else []
+    return launched, [cmd for cmd in journal if cmd[0] == "compose" and "run" in cmd]
+
+
+@pytest.mark.parametrize("script,copies,memory", [("run-gigaam-trt.sh", "1", "12g"), ("run-tone-trt.sh", "3", "16g")])
+def test_five_parallel_streams_get_cores_memory_and_model_copies(tmp_path, script, copies, memory):
+    if os.cpu_count() < 10:
+        pytest.skip("Для пяти потоков стенд просит 10 ядер")
+    launched, runs = fake_launch(tmp_path, script, "--parallel", "5", *(["--without-kenlm"] if "tone" in script else []))
+    assert launched.returncode == 0, launched.stdout + launched.stderr
+    assert f"Одновременно записей: 5; копий модели в Triton: {copies}; ядер: 10 (набор 0-9); память клиента: {memory}." in launched.stdout
+    compile_run, client = runs[1], runs[-1]
+    assert compile_run[compile_run.index("--instances") + 1] == copies
+    assert client[client.index("--parallel") + 1] == "5" and client.count("--parallel") == 1
+
+
+@pytest.mark.parametrize("script", ["run-gigaam-trt.sh", "run-tone-trt.sh"])
+def test_parallel_settings_are_refused_before_touching_docker_when_wrong(tmp_path, script):
+    for arguments, extra, message in ((["--parallel", "0"], {}, "от 1 до 32"), (["--parallel", "many"], {}, "от 1 до 32"),
+                                      (["--parallel", "2"], {"BENCH_CLIENT_CPUS": "9999"}, "на машине"),
+                                      (["--parallel", "2"], {"BENCH_TRITON_INSTANCES": "40"}, "от 1 до 16")):
+        folder = tmp_path / ("case-" + "-".join(arguments + list(extra.values())))
+        folder.mkdir()
+        launched, runs = fake_launch(folder, script, *arguments, **extra)
+        assert launched.returncode == 2 and message in launched.stderr and not runs
 
 
 @pytest.mark.parametrize("script", ["run-gigaam-trt.sh", "run-tone-trt.sh"])

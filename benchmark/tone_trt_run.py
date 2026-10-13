@@ -18,11 +18,13 @@ import time
 from benchmark.audio_check import decoder_info
 from benchmark.compare import Audio, host_info, setup_logging
 from benchmark.summary import write_summary
-from benchmark.trt_common import VAD_SETTINGS, parser, prepare, run_worker, save_json, summary_row
+from benchmark.trt_common import (REPORT_INTERVAL, VAD_SETTINGS, loop_statistics, parser, prepare, process_rows, run_worker,
+                                   save_json, summary_row, triton_statistics)
 from benchmark.tone_trt_prepare import TONE_REF, HF_REF, gpu_snapshot
 
 log = logging.getLogger("прогон-t-one-trt")
 LABELS = {"tone_trt_greedy": "T-one TensorRT без KenLM", "tone_trt_kenlm": "T-one TensorRT с KenLM"}
+MODEL = "streaming_acoustic"
 STAGES = {"conversion": "Пересчёт частоты", "acoustic": "Акустика и обмен с Triton",
           "splitter": "Границы фраз", "decoder": "Получение слов", "other": "Остальная обработка"}
 
@@ -40,7 +42,11 @@ def update(output, rows, conditions):
         label = LABELS[system]
         caption = (f"В среднем {mean:.3f} с; около {int(capacity)} записей за 15 минут"
                    if mean else "Успешных замеров с речью пока нет")
-        cards.append(f"<section><h2>{escape(label)}</h2><p>Завершено {processed} из {len(rows)}. {caption}.</p>")
+        wall = stats.get("wall")
+        flow = (f"Потоков: {wall['parallel']}. По часам, вместе с запуском клиента и прогревом перед каждой записью: около "
+                f"{int(wall['records_per_15_minutes'])} записей за 15 минут, в {wall['faster_than_realtime']:.0f} раз быстрее реального времени."
+                if wall else "")
+        cards.append(f"<section><h2>{escape(label)}</h2><p>Завершено {processed} из {len(rows)}. {caption}.</p>" + (f"<p>{escape(flow)}</p>" if flow else ""))
         cards.append("<p>Акустика работает на GPU. Разделение фраз и декодер работают на CPU.</p>")
         for key, value in stats.get("mean_record_wall_percent", {}).items():
             cards.append(f"<div class='part'><span>{escape(STAGES.get(key, key))}</span>"
@@ -85,7 +91,7 @@ async def run(args):
             "BENCH_GPU_MIN_FREE_MIB", "BENCH_GPU_MAX_UTIL", "BENCH_GPU_RESERVE_MIB")},
         "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(Path(__file__).parent.glob("*.py"))},
-        "protocol": {"concurrency": 1, "batch_size": 1, "model_server_load_per_record": False,
+        "protocol": {"concurrency": args.parallel, "batch_size": 1, "model_server_load_per_record": False,
             "decoder_load_per_record": True, "warmup_per_record": True,
             "threads": args.threads, "timeout_seconds_per_phase": args.timeout,
             "rpc_timeout_seconds": min(args.timeout, 60),
@@ -109,13 +115,17 @@ async def run(args):
         # Унаследованные параметры Silero нужны только для сверки источника:
         # официальный T-one не режет аудио ими и не сбрасывает контекст.
         conditions["reference_vad_settings_used_for_segmentation"] = False
+        conditions["loops"] = {}
         for system in systems:
             conditions["state"] = LABELS[system] + " выполняется"
             update(args.out, rows, conditions)
-            for index, row in enumerate(rows, 1):
+            reported = time.monotonic()
+
+            async def handle(index: int, row: dict, system=system) -> None:
+                nonlocal reported
                 log.info("%s %d/%d: %s", LABELS[system], index, len(rows), row["audio"].source)
                 payload = await run_worker({"system": system, "threads": args.threads, "timeout": args.timeout,
-                    "model_dir": str(args.model_dir), "audio": asdict(row["audio"]),
+                    "model_dir": str(args.model_dir), "audio": asdict(row["audio"]), "parallel": args.parallel,
                     "warmup": conditions["warmup"]["audio"], "output": str(args.out / row["directory"]),
                     "log_dir": str(args.out), "protocol": conditions["protocol"]})
                 result = payload["result"]
@@ -123,9 +133,17 @@ async def run(args):
                 save_json(args.out / row["directory"] / f"{system}.json", result)
                 (args.out / row["directory"] / f"{system}.txt").write_text(result.get("text", "") + "\n", encoding="utf-8")
                 row[system] = summary_row(result)
-                update(args.out, rows, conditions)
+                if time.monotonic() - reported >= REPORT_INTERVAL:
+                    update(args.out, rows, conditions)
+                    reported = time.monotonic()
                 if row[system].get("preparation_failed") or "резерв" in str(row[system].get("error")).lower():
                     raise RuntimeError(row[system]["error"])
+
+            before, loop_started = triton_statistics(MODEL), time.perf_counter()
+            try:
+                await process_rows(rows, args.parallel, handle)
+            finally:
+                conditions["loops"][system] = loop_statistics(args.parallel, time.perf_counter() - loop_started, before, triton_statistics(MODEL))
         code = int(any(r[s]["status"] not in {"ok", "no_speech"} for r in rows for s in systems))
         conditions["state"] = "Завершён с ошибками" if code else "Завершён"
     except (Exception, asyncio.CancelledError) as exc:
@@ -174,8 +192,8 @@ def main():
     cli.description = __doc__
     cli.add_argument("--without-kenlm", action="store_true", help="Только TensorRT greedy, без второго прогона")
     args = cli.parse_args()
-    if min(args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0:
-        cli.error("Число потоков и времена положительные")
+    if min(args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0 or not 1 <= args.parallel <= 32:
+        cli.error("Число потоков и времена положительные; одновременно от 1 до 32 записей")
     if args.threads != int(os.environ.get("BENCH_THREADS", str(args.threads))):
         cli.error("Число потоков задаётся через BENCH_THREADS")
     args.out.mkdir(parents=True, exist_ok=True)

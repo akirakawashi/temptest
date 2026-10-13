@@ -168,3 +168,46 @@ def test_unknown_worker_is_rejected_before_any_process_starts(monkeypatch, tmp_p
     with pytest.raises(ValueError, match="Неизвестный рабочий процесс"):
         asyncio.run(trt_common.run_worker({"system": "gigaam", "output": str(tmp_path), "timeout": 1}))
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("parallel", [1, 3, 5])
+def test_rows_are_processed_in_order_with_bounded_concurrency(parallel):
+    active, peak, started = 0, 0, []
+
+    async def handle(index, row):
+        nonlocal active, peak
+        started.append(index)
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(.01)
+        active -= 1
+        row["done"] = True
+
+    rows = [{} for _ in range(12)]
+    asyncio.run(trt_common.process_rows(rows, parallel, handle))
+    assert peak == parallel and started == list(range(1, 13)) and all(row["done"] for row in rows)
+
+
+def test_failure_stops_new_records_but_lets_running_ones_finish():
+    started, finished = [], []
+
+    async def handle(index, row):
+        started.append(index)
+        await asyncio.sleep(.01 if index != 2 else 0)
+        if index == 2:
+            raise RuntimeError("Нарушен резерв GPU")
+        finished.append(index)
+
+    with pytest.raises(RuntimeError, match="резерв"):
+        asyncio.run(trt_common.process_rows([{} for _ in range(20)], 3, handle))
+    assert started == [1, 2, 3] and finished == [1, 3]
+
+
+def test_loop_statistics_subtract_server_counters_and_survive_their_absence():
+    before = {"success": {"calls": 10, "seconds": 1.}, "queue": {"calls": 10, "seconds": .5}}
+    after = {"success": {"calls": 60, "seconds": 3.5}, "queue": {"calls": 60, "seconds": 2.}}
+    loop = trt_common.loop_statistics(5, 12., before, after)
+    assert loop == {"parallel": 5, "loop_seconds": 12., "triton": {"success": {"calls": 50, "seconds": 2.5}, "queue": {"calls": 50, "seconds": 1.5}}}
+    assert trt_common.loop_statistics(1, 3., None, after)["triton"] is None
+    # Вне контейнера клиента сервера моделей нет: счётчики просто отсутствуют.
+    assert trt_common.triton_statistics("gigaam_encoder") is None

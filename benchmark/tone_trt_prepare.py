@@ -99,7 +99,7 @@ def gpu_snapshot() -> dict:
     return info
 
 
-def model_config() -> str:
+def model_config(instances: int = 1) -> str:
     # Только batch=1; задержки накопления батча нет. Никаких CPU-инстансов.
     return '''name: "streaming_acoustic"
 platform: "tensorrt_plan"
@@ -112,16 +112,16 @@ output [
   { name: "logprobs" data_type: TYPE_FP32 dims: [10, 35] },
   { name: "state_next" data_type: TYPE_FP16 dims: [219729] }
 ]
-instance_group [{ count: 1 kind: KIND_GPU gpus: [0] }]
+instance_group [{ count: INSTANCES kind: KIND_GPU gpus: [0] }]
 model_warmup [{
   name: "warmup_batch_one" batch_size: 1 count: 10
   inputs: { key: "signal" value: { data_type: TYPE_INT32 dims: [2400, 1] zero_data: true } }
   inputs: { key: "state" value: { data_type: TYPE_FP16 dims: [219729] zero_data: true } }
 }]
-'''
+'''.replace("INSTANCES", str(instances))
 
 
-def compile_engine(cache: Path, output: Path, workspace_mib: int, timeout: int) -> None:
+def compile_engine(cache: Path, output: Path, workspace_mib: int, timeout: int, instances: int = 1) -> None:
     model = cache / "artifacts/model.onnx"
     if not model.is_file() or sha256(model) != ARTIFACTS["model.onnx"][1]:
         raise RuntimeError("Официальная ONNX-модель отсутствует или повреждена; сначала нужна загрузка")
@@ -158,8 +158,9 @@ def compile_engine(cache: Path, output: Path, workspace_mib: int, timeout: int) 
             temporary.replace(engine)
         finally:
             temporary.unlink(missing_ok=True)
-    (repository / "config.pbtxt").write_text(model_config())
-    metadata = {"fingerprint": fingerprint, "engine_sha256": sha256(engine),
+    # Движок один на все копии модели: их число меняет только конфигурацию сервера.
+    (repository / "config.pbtxt").write_text(model_config(instances))
+    metadata = {"fingerprint": fingerprint, "instances": instances, "engine_sha256": sha256(engine),
         "engine_size_bytes": engine.stat().st_size, "reused": reused,
         "preparation_seconds": time.perf_counter() - started,
         "prepared_at": datetime.now().astimezone().isoformat(), "gpu_after": gpu_snapshot(),
@@ -177,15 +178,16 @@ def main() -> None:
     cli.add_argument("--without-kenlm", action="store_true")
     cli.add_argument("--workspace-mib", type=int, default=1024)
     cli.add_argument("--timeout", type=int, default=3600)
+    cli.add_argument("--instances", type=int, default=1, help="Копий модели в Triton")
     args = cli.parse_args()
-    if not 128 <= args.workspace_mib <= 4096 or args.timeout <= 0:
-        cli.error("Workspace 128–4096 МиБ; время сборки положительное")
+    if not 128 <= args.workspace_mib <= 4096 or args.timeout <= 0 or not 1 <= args.instances <= 16:
+        cli.error("Workspace 128–4096 МиБ; время сборки положительное; копий модели от 1 до 16")
     args.out.mkdir(parents=True, exist_ok=True)
     setup_logging(args.out)
     if args.phase == "download":
         download(args.cache, not args.without_kenlm)
     else:
-        compile_engine(args.cache, args.out, args.workspace_mib, args.timeout)
+        compile_engine(args.cache, args.out, args.workspace_mib, args.timeout, args.instances)
 
 
 if __name__ == "__main__":

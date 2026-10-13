@@ -17,9 +17,10 @@ import time
 
 from benchmark.audio_check import decoder_info
 from benchmark.compare import Audio, host_info, setup_logging
-from benchmark.gigaam_trt_prepare import LABEL, MAX_FRAMES, MIN_FRAMES, SYSTEM, TRT_STAGES, vad_provider
+from benchmark.gigaam_trt_prepare import LABEL, MAX_FRAMES, MIN_FRAMES, MODEL, SYSTEM, TRT_STAGES, vad_provider
 from benchmark.summary import write_summary
-from benchmark.trt_common import VAD_SETTINGS, parser, prepare, run_worker, save_json, summary_row
+from benchmark.trt_common import (REPORT_INTERVAL, VAD_SETTINGS, loop_statistics, parser, prepare, process_rows, run_worker,
+                                   save_json, summary_row, triton_statistics)
 from benchmark.tone_trt_prepare import gpu_snapshot
 
 log = logging.getLogger("прогон-gigaam-trt")
@@ -35,7 +36,11 @@ def update(output: Path, rows: list[dict], conditions: dict) -> None:
     processed = sum(stats["statuses"][key] for key in ("ok", "no_speech"))
     caption = (f"В среднем {mean:.3f} с на запись; около {int(stats['records_per_15_minutes'])} записей за 15 минут"
                if mean else "Успешных замеров с речью пока нет")
-    cards = [f"<section><h2>{escape(LABEL)}</h2><p>Завершено {processed} из {len(rows)}. {caption}.</p>",
+    wall = stats.get("wall")
+    flow = (f"Потоков: {wall['parallel']}. По часам, вместе с запуском клиента и прогревом перед каждой записью: около "
+            f"{int(wall['records_per_15_minutes'])} записей за 15 минут, в {wall['faster_than_realtime']:.0f} раз быстрее реального времени."
+            if wall else "")
+    cards = [f"<section><h2>{escape(LABEL)}</h2><p>Завершено {processed} из {len(rows)}. {caption}.</p>" + (f"<p>{escape(flow)}</p>" if flow else ""),
              "<p>Энкодер работает на GPU через TensorRT. Признаки и декодер считаются на CPU.</p>"]
     for key, value in stats.get("mean_record_wall_percent", {}).items():
         if key in WALL:
@@ -57,7 +62,7 @@ def update(output: Path, rows: list[dict], conditions: dict) -> None:
         cards.append(f"<div class='part'><span>{escape(Path(row['directory']).name)}</span>"
                      f"<i style='width:{seconds / maximum * 75:.2f}%'></i><b>{seconds:.2f} с</b></div>")
     cards.append("</section>")
-    tables, markdown = [], ["# GigaAM TensorRT", "", conditions["state"], "", caption + ".", ""]
+    tables, markdown = [], ["# GigaAM TensorRT", "", conditions["state"], "", caption + ".", *([flow, ""] if flow else [""])]
     for row in rows:
         result = row.get(SYSTEM, {})
         seconds, recognition = result.get("elapsed_seconds"), result.get("asr_seconds")
@@ -91,7 +96,7 @@ async def run(args) -> int:
             "BENCH_GPU_MIN_FREE_MIB", "BENCH_GPU_MAX_UTIL", "BENCH_GPU_RESERVE_MIB")},
         "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(Path(__file__).parent.glob("*.py"))},
-        "protocol": {"concurrency": 1, "batch_size": 1, "model_server_load_per_record": False,
+        "protocol": {"concurrency": args.parallel, "batch_size": 1, "model_server_load_per_record": False,
             "client_load_per_record": True, "warmup_per_record": True,
             "threads": args.threads, "timeout_seconds_per_phase": args.timeout,
             "rpc_timeout_seconds": min(args.timeout, 60),
@@ -115,10 +120,13 @@ async def run(args) -> int:
         rows = prepare(args, conditions)
         conditions["state"] = LABEL + " выполняется"
         update(args.out, rows, conditions)
-        for index, row in enumerate(rows, 1):
+        reported = time.monotonic()
+
+        async def handle(index: int, row: dict) -> None:
+            nonlocal reported
             log.info("%s %d/%d: %s", LABEL, index, len(rows), row["audio"].source)
             payload = await run_worker({"system": SYSTEM, "threads": args.threads, "timeout": args.timeout,
-                "model_dir": str(args.model_dir), "vad_settings": conditions["vad_settings"],
+                "model_dir": str(args.model_dir), "vad_settings": conditions["vad_settings"], "parallel": args.parallel,
                 "audio": asdict(row["audio"]), "warmup": conditions["warmup"]["audio"],
                 "output": str(args.out / row["directory"]), "log_dir": str(args.out), "protocol": conditions["protocol"]})
             result = payload["result"]
@@ -126,9 +134,17 @@ async def run(args) -> int:
             save_json(args.out / row["directory"] / f"{SYSTEM}.json", result)
             (args.out / row["directory"] / f"{SYSTEM}.txt").write_text(result.get("text", "") + "\n", encoding="utf-8")
             row[SYSTEM] = summary_row(result)
-            update(args.out, rows, conditions)
+            if time.monotonic() - reported >= REPORT_INTERVAL:
+                update(args.out, rows, conditions)
+                reported = time.monotonic()
             if row[SYSTEM].get("preparation_failed") or "резерв" in str(row[SYSTEM].get("error")).lower():
                 raise RuntimeError(row[SYSTEM]["error"])
+
+        before, loop_started = triton_statistics(MODEL), time.perf_counter()
+        try:
+            await process_rows(rows, args.parallel, handle)
+        finally:
+            conditions["loops"] = {SYSTEM: loop_statistics(args.parallel, time.perf_counter() - loop_started, before, triton_statistics(MODEL))}
         code = int(any(row[SYSTEM]["status"] not in {"ok", "no_speech"} for row in rows))
         conditions["state"] = "Завершён с ошибками" if code else "Завершён"
     except (Exception, asyncio.CancelledError) as exc:
@@ -175,8 +191,8 @@ def main() -> int:
     cli = parser()
     cli.description = __doc__
     args = cli.parse_args()
-    if min(args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0:
-        cli.error("Число потоков и времена положительные")
+    if min(args.threads, args.timeout, args.warmup_seconds, args.max_audio_seconds) <= 0 or not 1 <= args.parallel <= 32:
+        cli.error("Число потоков и времена положительные; одновременно от 1 до 32 записей")
     if args.threads != int(os.environ.get("BENCH_THREADS", str(args.threads))):
         cli.error("Число потоков задаётся через BENCH_THREADS")
     args.out.mkdir(parents=True, exist_ok=True)

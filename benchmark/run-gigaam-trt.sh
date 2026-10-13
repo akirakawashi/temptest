@@ -11,6 +11,7 @@ export BENCH_AUDIO_DIR="$(cd -- "$1" && pwd -P)"
 shift
 TRT_ARGS=() TRT_REFERENCE_ARGS=()
 TRT_REFERENCE=''
+TRT_PARALLEL=1
 TRT_IMAGE='nvcr.io/nvidia/tritonserver:25.06-py3'
 while (( $# )); do
     case "$1" in
@@ -23,6 +24,11 @@ while (( $# )); do
             shift 2 ;;
         --out|--model-dir|--finalize|--out=*|--model-dir=*|--finalize=*)
             echo 'Папки модели и результатов задаются стендом' >&2; exit 2 ;;
+        --parallel)
+            [[ $# -ge 2 && "$2" =~ ^[0-9]{1,2}$ ]] && (( 10#$2 >= 1 && 10#$2 <= 32 )) || {
+                echo '--parallel требует число одновременных записей от 1 до 32' >&2; exit 2;
+            }
+            TRT_PARALLEL=$((10#$2)); shift 2 ;;
         --gap|--gap=*|--expected-files|--expected-files=*)
             echo "$1 больше нет: обрабатываются все записи папки, пауз между ними нет" >&2; exit 2 ;;
         *) TRT_ARGS+=("$1"); shift ;;
@@ -32,7 +38,17 @@ exec 9>"$TRT_PROJECT_DIR/.benchmark.lock"
 flock -n 9 || { echo 'Другой тест стенда уже выполняется' >&2; exit 2; }
 export BENCH_OUT="${BENCH_OUT:-$TRT_PROJECT_DIR/benchmark-results}"
 export BENCH_CACHE="${BENCH_CACHE:-$TRT_PROJECT_DIR/benchmark-cache}"
-export BENCH_GPU="${BENCH_GPU:-0}" BENCH_THREADS="${BENCH_THREADS:-4}" BENCH_CPUSET="${BENCH_CPUSET:-0-3}"
+export BENCH_GPU="${BENCH_GPU:-0}" BENCH_THREADS="${BENCH_THREADS:-4}"
+if (( TRT_PARALLEL > 1 )); then
+    # Потоки делят ядра: по два на поток; сервер моделей работает на том же наборе.
+    TRT_CORES=$(( TRT_PARALLEL * 2 )) TRT_MEMORY=$(( TRT_PARALLEL * 2 + 2 ))
+    (( TRT_MEMORY >= 8 )) || TRT_MEMORY=8
+    export BENCH_CLIENT_CPUS="${BENCH_CLIENT_CPUS:-$TRT_CORES}" BENCH_CPUSET="${BENCH_CPUSET:-0-$(( TRT_CORES - 1 ))}"
+    export BENCH_CLIENT_MEMORY="${BENCH_CLIENT_MEMORY:-${TRT_MEMORY}g}"
+fi
+export BENCH_CLIENT_CPUS="${BENCH_CLIENT_CPUS:-$BENCH_THREADS}" BENCH_CPUSET="${BENCH_CPUSET:-0-3}"
+export BENCH_CLIENT_MEMORY="${BENCH_CLIENT_MEMORY:-8g}"
+export BENCH_TRITON_INSTANCES="${BENCH_TRITON_INSTANCES:-$(( (TRT_PARALLEL + 4) / 5 ))}"
 export BENCH_GPU_MIN_FREE_MIB="${BENCH_GPU_MIN_FREE_MIB:-12288}" BENCH_GPU_MAX_UTIL="${BENCH_GPU_MAX_UTIL:-10}"
 export BENCH_GPU_RESERVE_MIB="${BENCH_GPU_RESERVE_MIB:-3072}"
 export BENCH_BUILD_NETWORK="${BENCH_BUILD_NETWORK:-default}" BENCH_DOWNLOAD_NETWORK="${BENCH_DOWNLOAD_NETWORK:-host}"
@@ -41,10 +57,12 @@ TRT_MIN_RAM="${BENCH_MIN_RAM_MIB:-24576}" TRT_MIN_DISK="${BENCH_MIN_DISK_MIB:-32
 TRT_WORKSPACE="${BENCH_TRT_WORKSPACE_MIB:-4096}" TRT_COMPILE_TIMEOUT="${BENCH_TRT_COMPILE_TIMEOUT:-3600}"
 export BENCH_VAD_PROVIDER="${BENCH_VAD_PROVIDER:-cpu}"
 [[ "$BENCH_VAD_PROVIDER" == cpu || "$BENCH_VAD_PROVIDER" == cuda ]] || { echo 'BENCH_VAD_PROVIDER должен быть cpu или cuda' >&2; exit 2; }
-for number in "$BENCH_GPU" "$BENCH_THREADS" "$BENCH_GPU_MIN_FREE_MIB" "$BENCH_GPU_MAX_UTIL" "$BENCH_GPU_RESERVE_MIB" "$TRT_MIN_RAM" "$TRT_MIN_DISK" "$TRT_WORKSPACE" "$TRT_COMPILE_TIMEOUT"; do
+for number in "$BENCH_GPU" "$BENCH_THREADS" "$BENCH_GPU_MIN_FREE_MIB" "$BENCH_GPU_MAX_UTIL" "$BENCH_GPU_RESERVE_MIB" "$TRT_MIN_RAM" "$TRT_MIN_DISK" "$TRT_WORKSPACE" "$TRT_COMPILE_TIMEOUT" "$BENCH_CLIENT_CPUS" "$BENCH_TRITON_INSTANCES"; do
     [[ "$number" =~ ^[0-9]+$ ]] || { echo 'Номер GPU, пороги и времена должны быть целыми числами' >&2; exit 2; }
 done
 (( BENCH_THREADS > 0 && BENCH_GPU_MAX_UTIL <= 100 && TRT_WORKSPACE >= 512 && TRT_WORKSPACE <= 8192 && TRT_COMPILE_TIMEOUT > 0 )) || exit 2
+(( BENCH_CLIENT_CPUS >= 1 && BENCH_TRITON_INSTANCES >= 1 && BENCH_TRITON_INSTANCES <= 16 )) || { echo 'Ядер клиенту — не меньше одного, копий модели — от 1 до 16' >&2; exit 2; }
+(( BENCH_CLIENT_CPUS <= $(nproc --all) )) || { echo "Запрошено ядер: $BENCH_CLIENT_CPUS, на машине $(nproc --all). Уменьшите --parallel или задайте BENCH_CLIENT_CPUS" >&2; exit 2; }
 [[ "$BENCH_BUILD_NETWORK" == default || "$BENCH_BUILD_NETWORK" == host ]] || exit 2
 [[ "$BENCH_DOWNLOAD_NETWORK" == default || "$BENCH_DOWNLOAD_NETWORK" == host ]] || exit 2
 mkdir -p -- "$BENCH_OUT" "$BENCH_CACHE/gigaam-trt" "$BENCH_CACHE/gigaam"
@@ -171,6 +189,7 @@ wait_task() {
 }
 echo "Прогон $TRT_RUN_ID: GigaAM TensorRT — поиск речи, распознавание и паузы; голоса, эмоции и LLM не запускаются."
 echo "GPU $BENCH_GPU; поиск речи: $BENCH_VAD_PROVIDER; модели в $BENCH_CACHE/gigaam-trt; результаты $BENCH_RUN_OUT."
+echo "Одновременно записей: $TRT_PARALLEL; копий модели в Triton: $BENCH_TRITON_INSTANCES; ядер: $BENCH_CLIENT_CPUS (набор $BENCH_CPUSET); память клиента: $BENCH_CLIENT_MEMORY."
 echo 'Экспорт модели и сборка TensorRT — вне замеров. Обработка: внутренняя сеть, без публикации портов.'
 active=$(timeout 15 docker ps -q --filter label=com.docker.compose.project=speech-comparison-gigaam-trt)
 if [[ -n "$active" ]]; then
@@ -209,7 +228,7 @@ wait_task "speech-comparison-gigaam-trt-export-$TRT_RUN_ID" экспорт
 monitor_gpu 9>&- &
 TRT_MONITOR_PID=$!
 start_container "speech-comparison-gigaam-trt-compile-$TRT_RUN_ID" compile \
-    compile --out /results --workspace-mib "$TRT_WORKSPACE" --timeout "$TRT_COMPILE_TIMEOUT"
+    compile --out /results --workspace-mib "$TRT_WORKSPACE" --timeout "$TRT_COMPILE_TIMEOUT" --instances "$BENCH_TRITON_INSTANCES"
 wait_task "speech-comparison-gigaam-trt-compile-$TRT_RUN_ID" сборка-tensorrt
 TRT_SERVER="speech-comparison-gigaam-trt-server-$TRT_RUN_ID"
 start_container "$TRT_SERVER" triton
@@ -229,7 +248,7 @@ while true; do
     sleep 5
 done
 echo 'Наш Triton готов; начинаем корпус. Загрузка серверной модели исключена из замеров.'
-start_container "speech-comparison-gigaam-trt-client-$TRT_RUN_ID" client /recordings \
+start_container "speech-comparison-gigaam-trt-client-$TRT_RUN_ID" client /recordings --parallel "$TRT_PARALLEL" \
     --out /results "${TRT_REFERENCE_ARGS[@]}" "${TRT_ARGS[@]}"
 wait_task "speech-comparison-gigaam-trt-client-$TRT_RUN_ID" gigaam-trt
 timeout 30 docker logs "$TRT_SERVER" > "$BENCH_RUN_OUT/логи/triton.log" 2>&1 || true

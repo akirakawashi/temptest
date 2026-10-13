@@ -81,8 +81,9 @@ async def execute(request: dict) -> dict:
         result = await runner.run(samples)
         preparation["measurement_finished_at"] = datetime.now().astimezone().isoformat()
         preparation["server_statistics_after"] = runner.statistics()
-        result["triton_statistics_delta"] = statistics_delta(preparation["server_statistics_before"],
-            preparation["server_statistics_after"], result["triton_requests"], MODEL)
+        result["triton_statistics_delta"] = ({"available": False, "note": "Записи шли одновременно: счётчики сервера общие для всех потоков"} if request.get("parallel", 1) > 1 else
+            statistics_delta(preparation["server_statistics_before"], preparation["server_statistics_after"],
+                             result["triton_requests"], MODEL))
         preparation["gpu_after_measurement"] = gpu_snapshot()
         log.info("%s: статус %s; обработка %.3f с; распознавание %.3f с; запросов Triton %d; части %s", system,
                  result["status"], result["elapsed_seconds"], result["asr_seconds"], result["triton_requests"], result["trt_stages"])

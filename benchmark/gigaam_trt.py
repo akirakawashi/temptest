@@ -5,6 +5,7 @@ import asyncio
 import importlib.metadata
 import json
 import logging
+import os
 from pathlib import Path
 import time
 
@@ -21,14 +22,14 @@ log = logging.getLogger("gigaam-tensorrt")
 ENDPOINT, VERSION = "triton:8001", "1"
 
 
-def validate_config(response: dict) -> dict:
+def validate_config(response: dict, copies: int = 1) -> dict:
     config = response.get("config", response)
     instances = config.get("instance_group", [])
     if (config.get("name") != MODEL or config.get("platform") != "tensorrt_plan"
             or int(config.get("max_batch_size", 0)) != 0 or len(instances) != 1
             or instances[0].get("kind") != "KIND_GPU"
-            or instances[0].get("gpus") != [0] or instances[0].get("count", 1) != 1):
-        raise RuntimeError("Triton должен использовать только TensorRT на GPU:0, один инстанс, без батчей")
+            or instances[0].get("gpus") != [0] or instances[0].get("count", 1) != copies):
+        raise RuntimeError(f"Triton должен использовать только TensorRT на GPU:0, копий модели: {copies}, без батчей")
     expected = {"audio_signal": ("TYPE_FP32", [1, FEATURES, -1]), "length": ("TYPE_INT64", [1])}
     actual = {item["name"]: (item["data_type"], [int(d) for d in item["dims"]]) for item in config.get("input", [])}
     if actual != expected:
@@ -168,7 +169,8 @@ class GigaTrtEngines(Engines):
         deadline = min(self.timeout, 30)
         if not self.client.is_server_ready(client_timeout=deadline) or not self.client.is_model_ready(MODEL, VERSION, client_timeout=deadline):
             raise RuntimeError("Внутренний Triton или модель не готовы")
-        self.config = validate_config(self.client.get_model_config(MODEL, VERSION, as_json=True, client_timeout=deadline))
+        self.config = validate_config(self.client.get_model_config(MODEL, VERSION, as_json=True, client_timeout=deadline),
+                                      int(os.environ.get("BENCH_TRITON_INSTANCES", "1")))
         self.server_metadata = self.client.get_server_metadata(as_json=True, client_timeout=deadline)
         self.model_metadata = self.client.get_model_metadata(MODEL, VERSION, as_json=True, client_timeout=deadline)
         self.encoder = TritonEncoder(self.client, grpc, self.timeout)

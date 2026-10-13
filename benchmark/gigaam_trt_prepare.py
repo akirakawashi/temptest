@@ -78,7 +78,7 @@ def export(cache: Path, weights: Path) -> None:
     log.info("Экспорт подготовлен за %.1f с", time.perf_counter() - started)
 
 
-def model_config() -> str:
+def model_config(instances: int = 1) -> str:
     # Один запрос — один фрагмент речи; батчей и CPU-инстансов нет.
     return f'''name: "{MODEL}"
 platform: "tensorrt_plan"
@@ -91,11 +91,11 @@ output [
   {{ name: "encoded" data_type: TYPE_FP32 dims: [1, {HIDDEN}, -1] }},
   {{ name: "encoded_len" data_type: TYPE_INT32 dims: [1] }}
 ]
-instance_group [{{ count: 1 kind: KIND_GPU gpus: [0] }}]
+instance_group [{{ count: {instances} kind: KIND_GPU gpus: [0] }}]
 '''
 
 
-def compile_engine(cache: Path, output: Path, workspace_mib: int, timeout: int) -> None:
+def compile_engine(cache: Path, output: Path, workspace_mib: int, timeout: int, instances: int = 1) -> None:
     manifest_path = cache / "артефакты.json"
     if not manifest_path.is_file():
         raise RuntimeError("Нет экспортированной модели; сначала нужен экспорт")
@@ -135,8 +135,9 @@ def compile_engine(cache: Path, output: Path, workspace_mib: int, timeout: int) 
             temporary.replace(engine)
         finally:
             temporary.unlink(missing_ok=True)
-    (repository / "config.pbtxt").write_text(model_config())
-    metadata = {"fingerprint": fingerprint, "engine_sha256": sha256(engine),
+    # Движок один на все копии модели: их число меняет только конфигурацию сервера.
+    (repository / "config.pbtxt").write_text(model_config(instances))
+    metadata = {"fingerprint": fingerprint, "instances": instances, "engine_sha256": sha256(engine),
         "engine_size_bytes": engine.stat().st_size, "reused": reused,
         "preparation_seconds": time.perf_counter() - started,
         "prepared_at": datetime.now().astimezone().isoformat(), "gpu_after": gpu_snapshot(),
@@ -154,15 +155,16 @@ def main() -> None:
     cli.add_argument("--out", type=Path, required=True)
     cli.add_argument("--workspace-mib", type=int, default=4096)
     cli.add_argument("--timeout", type=int, default=3600)
+    cli.add_argument("--instances", type=int, default=1, help="Копий модели в Triton")
     args = cli.parse_args()
-    if not 512 <= args.workspace_mib <= 8192 or args.timeout <= 0:
-        cli.error("Workspace 512–8192 МиБ; время сборки положительное")
+    if not 512 <= args.workspace_mib <= 8192 or args.timeout <= 0 or not 1 <= args.instances <= 16:
+        cli.error("Workspace 512–8192 МиБ; время сборки положительное; копий модели от 1 до 16")
     args.out.mkdir(parents=True, exist_ok=True)
     setup_logging(args.out)
     if args.phase == "export":
         export(args.cache, args.weights)
     else:
-        compile_engine(args.cache, args.out, args.workspace_mib, args.timeout)
+        compile_engine(args.cache, args.out, args.workspace_mib, args.timeout, args.instances)
 
 
 if __name__ == "__main__":

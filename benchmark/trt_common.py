@@ -22,6 +22,8 @@ WORKERS = {"tone_trt_greedy": "benchmark.tone_trt_worker", "tone_trt_kenlm": "be
            "gigaam_trt": "benchmark.gigaam_trt_worker"}
 # Подробности записи лежат в её файле; сводке и отчёту они не нужны, а на тысячах записей занимают гигабайты памяти.
 HEAVY = ("stage_calls", "speech_segments", "events", "utterances", "raw_phrases", "pauses", "counters")
+# Отчёт переписывается целиком, поэтому не после каждой записи: на тысячах записей это съедало бы время потоков.
+REPORT_INTERVAL = 5.
 
 
 def save_json(path: Path, value):
@@ -32,6 +34,58 @@ def save_json(path: Path, value):
 
 def summary_row(result: dict) -> dict:
     return {key: value for key, value in result.items() if key not in HEAVY}
+
+
+async def process_rows(rows: list[dict], parallel: int, handle) -> None:
+    """Записи идут по порядку, не больше parallel одновременно; после сбоя новые не начинаются."""
+    queue, failures = iter(enumerate(rows, 1)), []
+
+    async def stream():
+        for index, row in queue:
+            if failures:
+                return
+            try:
+                await handle(index, row)
+            except Exception as exc:
+                failures.append(exc)
+                return
+
+    tasks = [asyncio.create_task(stream()) for _ in range(parallel)]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    if failures:
+        raise failures[0]
+
+
+def triton_statistics(model: str) -> dict | None:
+    """Счётчики модели за всё время работы сервера; None, если сервер или его клиент недоступны."""
+    try:
+        import tritonclient.grpc as grpc
+
+        client = grpc.InferenceServerClient("triton:8001")
+        try:
+            stats = client.get_inference_statistics(model, "1", as_json=True, client_timeout=30)
+        finally:
+            client.close()
+        row = next(item["inference_stats"] for item in stats["model_stats"] if item["name"] == model)
+        return {key: {"calls": int(row.get(key, {}).get("count", 0)), "seconds": int(row.get(key, {}).get("ns", 0)) / 1e9}
+                for key in ("success", "fail", "queue", "compute_input", "compute_infer", "compute_output")}
+    except Exception:
+        return None
+
+
+def loop_statistics(parallel: int, seconds: float, before: dict | None, after: dict | None) -> dict:
+    """Итог прохода по корпусу: время по часам и работа сервера моделей за этот проход."""
+    result = {"parallel": parallel, "loop_seconds": seconds, "triton": None}
+    if before and after:
+        result["triton"] = {key: {"calls": after[key]["calls"] - before[key]["calls"],
+                                  "seconds": after[key]["seconds"] - before[key]["seconds"]} for key in after}
+    return result
 
 
 def reference_files(files: list[Path], reference: dict | None):
@@ -171,6 +225,7 @@ def parser():
     cli.add_argument("--reference-run", type=Path)
     cli.add_argument("--model-dir", type=Path, default=Path("/cache"))
     cli.add_argument("--threads", type=int, default=int(os.environ.get("BENCH_THREADS", "4")))
+    cli.add_argument("--parallel", type=int, default=1, help="Сколько записей обрабатывать одновременно")
     cli.add_argument("--timeout", type=int, default=3600)
     cli.add_argument("--warmup-file", type=Path)
     cli.add_argument("--warmup-seconds", type=float, default=30.)
